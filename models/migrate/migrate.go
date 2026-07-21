@@ -119,8 +119,8 @@ func MigrateTables(db *gorm.DB) error {
 		&models.UserToken{}, &models.DashAnnotation{}, MessageTemplate{}, NotifyRule{}, NotifyChannelConfig{}, &EsIndexPatternMigrate{},
 		&models.EventPipeline{}, &models.EmbeddedProduct{}, &models.SourceToken{},
 		&models.SavedView{}, &models.UserViewFavorite{},
-		&models.AILLMConfig{}, &models.AIAgent{}, &models.AISkill{}, &models.MCPServer{},
-		&models.AssistantChatRow{}, &models.SandboxExecutionRecord{}}
+		&models.AILLMConfig{}, &models.AIAgent{}, &models.AISkill{},
+		&models.AssistantChatRow{}}
 
 	if isPostgres(db) {
 		dts = append(dts, &models.AssistantMessageRow{}) // PostgreSQL: text is unlimited
@@ -151,6 +151,15 @@ func MigrateTables(db *gorm.DB) error {
 		for _, dt := range asyncDts {
 			if err := db.AutoMigrate(dt); err != nil {
 				logger.Errorf("failed to migrate table %+v err:%v", dt, err)
+			}
+		}
+
+		// 索引用原生 SQL 创建，不在部分结构体上声明 group_id 列：
+		// 存量库该列是 bigint unsigned 且无默认值，声明列会让 AutoMigrate
+		// 发出 MODIFY COLUMN，在大表上全表重建锁写
+		if !db.Migrator().HasIndex("alert_his_event", "idx_group_last_eval_time") {
+			if err := db.Exec("CREATE INDEX idx_group_last_eval_time ON alert_his_event(group_id, last_eval_time)").Error; err != nil {
+				logger.Errorf("failed to create index idx_group_last_eval_time on alert_his_event: %v", err)
 			}
 		}
 	}()
@@ -255,6 +264,7 @@ type AlertSubscribe struct {
 type AlertMute struct {
 	Severities string `gorm:"column:severities;type:varchar(32);not null;default:''"`
 	Tags       string `gorm:"column:tags;type:varchar(4096);default:'[]';comment:json,map,tagkey->regexp|value"`
+	MuteType   int    `gorm:"column:mute_type;type:int;not null;default:0;comment:0-mute event and notify,1-mute notify only"`
 }
 
 type RecordingRule struct {
@@ -403,6 +413,7 @@ type MessageTemplate struct {
 	NotifyChannelIdent string            `gorm:"column:notify_channel_ident;type:varchar(64);not null;default:''"`
 	Private            int               `gorm:"column:private;type:int;not null;default:0"`
 	Weight             int               `gorm:"column:weight;type:int;not null;default:0"`
+	Lang               string            `gorm:"column:lang;type:varchar(32);not null;default:''"`
 	CreateAt           int64             `gorm:"column:create_at;not null;default:0"`
 	CreateBy           string            `gorm:"column:create_by;type:varchar(64);not null;default:''"`
 	UpdateAt           int64             `gorm:"column:update_at;not null;default:0"`

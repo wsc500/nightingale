@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ccfos/nightingale/v6/aiagent"
+	"github.com/ccfos/nightingale/v6/aiagent/a2a"
 	"github.com/ccfos/nightingale/v6/aiagent/llm"
 	"github.com/ccfos/nightingale/v6/aiagent/skill"
 	aitools "github.com/ccfos/nightingale/v6/aiagent/tools"
@@ -72,6 +73,17 @@ type Router struct {
 	TargetDeleteCheck     TargetDeleteCheckFunc
 	TargetBgidChangeCheck TargetBgidChangeCheckFunc
 	AlertRuleModifyHook   AlertRuleModifyHookFunc
+
+	// MCPExtraToolsets lets an embedder (e.g. the enterprise edition) register
+	// additional MCP toolsets on /mcp beyond n9e-mcp-server's defaults. Set it
+	// before Config(r); the registrars run when the /mcp handler is built.
+	MCPExtraToolsets []a2a.MCPToolsetRegistrar
+
+	// AgentToolSourcesHook lets an embedder contribute per-run external tool
+	// sources to AI chat (e.g. the enterprise edition's MCP client translates
+	// the agent's bound MCP servers into sources, scoped to the chatting user).
+	// nil means agents run with no external tool sources.
+	AgentToolSourcesHook func(agent *models.AIAgent, me *models.User) []aiagent.ToolSource
 
 	// aiSkillSyncOnce ensures the DB→FS full sync runs at most once per process
 	// lifetime (startup goroutine + first chat handler both call through the
@@ -513,6 +525,7 @@ func (rt *Router) Config(r *gin.Engine) {
 
 		// card logic
 		pages.GET("/alert-cur-events/list", rt.auth(), rt.user(), rt.alertCurEventsList)
+		pages.POST("/alert-cur-events/list", rt.auth(), rt.user(), rt.alertCurEventsList)
 		pages.GET("/alert-cur-events/card", rt.auth(), rt.user(), rt.alertCurEventsCard)
 		pages.POST("/alert-cur-events/card/details", rt.auth(), rt.alertCurEventsCardDetails)
 		pages.GET("/alert-his-events/list", rt.auth(), rt.user(), rt.alertHisEventsList)
@@ -637,14 +650,6 @@ func (rt *Router) Config(r *gin.Engine) {
 		pages.POST("/ai-skill/:id/git/update", rt.auth(), rt.user(), rt.perm("/ai-config/skills"), rt.aiSkillGitUpdate)
 		pages.GET("/ai-skill-file/:fileId", rt.auth(), rt.user(), rt.perm("/ai-config/skills"), rt.aiSkillFileGet)
 		pages.DELETE("/ai-skill-file/:fileId", rt.auth(), rt.user(), rt.perm("/ai-config/skills"), rt.aiSkillFileDel)
-
-		pages.GET("/mcp-servers", rt.auth(), rt.admin(), rt.mcpServerGets)
-		pages.GET("/mcp-server/:id", rt.auth(), rt.admin(), rt.mcpServerGet)
-		pages.POST("/mcp-servers", rt.auth(), rt.admin(), rt.mcpServerAdd)
-		pages.PUT("/mcp-server/:id", rt.auth(), rt.admin(), rt.mcpServerPut)
-		pages.DELETE("/mcp-server/:id", rt.auth(), rt.admin(), rt.mcpServerDel)
-		pages.POST("/mcp-server/test", rt.auth(), rt.admin(), rt.mcpServerTest)
-		pages.GET("/mcp-server/:id/tools", rt.auth(), rt.admin(), rt.mcpServerTools)
 
 		// AI Assistant Chat
 		pages.POST("/assistant/chat/new", rt.auth(), rt.user(), rt.assistantChatNew)

@@ -26,6 +26,10 @@ func runSkillScript(ctx context.Context, deps *aiagent.ToolDeps, args map[string
 	if skillName == "" {
 		return "", fmt.Errorf("skill_name is required")
 	}
+	// 私有 skill 对未授权用户不可用：按名执行前先拦截，返回「未找到」不泄露其存在。
+	if deps.IsSkillHidden(skillName) {
+		return "", fmt.Errorf("skill %q not found", skillName)
+	}
 
 	if deps.Sandbox == nil || !deps.Sandbox.Enabled() {
 		reason := "skill 脚本执行未在本服务端启用"
@@ -66,7 +70,29 @@ func runSkillScript(ctx context.Context, deps *aiagent.ToolDeps, args map[string
 		}
 		return "", err
 	}
-	return out, nil
+	// Surface the actual isolation level of this run so the degradation (e.g. a
+	// host that fell back to unsafe-exec) is visible in the conversation, not
+	// only in server logs.
+	return fmt.Sprintf("（本次执行隔离级别：%s）\n%s", isolationLabel(deps.Sandbox.EngineName()), out), nil
+}
+
+// isolationLabel maps a sandbox engine name to a human-readable isolation level
+// for the tool result. unsafe-exec is called out explicitly as no-isolation.
+func isolationLabel(engine string) string {
+	switch engine {
+	case sandbox.EngineUnsafe:
+		return "无隔离（unsafe-exec，脚本直接在宿主执行）"
+	case sandbox.EngineBwrap:
+		return "bubblewrap（用户命名空间 + seccomp + 文件系统隔离）"
+	case sandbox.EngineConfined:
+		return "container-confined（容器边界 + seccomp/landlock）"
+	case sandbox.EngineRunsc:
+		return "gVisor/runsc（强隔离）"
+	case "":
+		return "未知"
+	default:
+		return engine
+	}
 }
 
 // argStringSlice coerces an arg into a []string, tolerating a JSON array, a Go

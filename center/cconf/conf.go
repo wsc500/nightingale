@@ -20,13 +20,16 @@ type Center struct {
 	EventHistoryGroupView     bool
 	CleanNotifyRecordDay      int
 	CleanPipelineExecutionDay int
+	// CleanAlertHisEventDay 历史告警事件保留天数，<= 0 表示永久保留不清理
+	CleanAlertHisEventDay int
 	MigrateBusiGroupLabel     bool
 	RSA                       httpx.RSAConfig
 	AIAgent                   AIAgent
 
 	// Sandbox isolates execution of user-uploaded Skill Python/Bash scripts
-	// (pkg/sandbox). Default-disabled-but-safe: non-Linux / insufficient kernel
-	// capabilities degrade to "skill execution off" unless dev_mode is set.
+	// (pkg/sandbox). Fail-open: non-Linux / insufficient kernel capabilities
+	// degrade to the unsafe-exec floor so scripts still run; set
+	// Sandbox.RequireIsolation=true to refuse execution without real isolation.
 	Sandbox sandbox.Config
 }
 

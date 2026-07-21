@@ -143,7 +143,7 @@ func (rt *Router) alertRuleAddByFE(c *gin.Context) {
 	}
 
 	bgid := ginx.UrlParamInt64(c, "id")
-	reterr := rt.alertRuleAdd(lst, username, bgid, c.GetHeader("X-Language"))
+	reterr := rt.alertRuleAdd(c, lst, username, bgid, c.GetHeader("X-Language"))
 
 	ginx.NewRender(c).Data(reterr, nil)
 }
@@ -296,9 +296,9 @@ func (rt *Router) alertRuleAddByImport(c *gin.Context) {
 
 	var reterr map[string]string
 	if force {
-		reterr = rt.alertRuleUpsert(lst, username, bgid, lang)
+		reterr = rt.alertRuleUpsert(c, lst, username, bgid, lang)
 	} else {
-		reterr = rt.alertRuleAdd(lst, username, bgid, lang)
+		reterr = rt.alertRuleAdd(c, lst, username, bgid, lang)
 	}
 
 	ginx.NewRender(c).Data(reterr, nil)
@@ -322,7 +322,7 @@ func (rt *Router) alertRuleAddByImportPromRule(c *gin.Context) {
 	lst := models.DealPromGroup(groups, f.DatasourceQueries, f.Disabled)
 	username := c.MustGet("username").(string)
 	bgid := ginx.UrlParamInt64(c, "id")
-	ginx.NewRender(c).Data(rt.alertRuleAdd(lst, username, bgid, c.GetHeader("X-Language")), nil)
+	ginx.NewRender(c).Data(rt.alertRuleAdd(c, lst, username, bgid, c.GetHeader("X-Language")), nil)
 }
 
 func (rt *Router) alertRuleAddByService(c *gin.Context) {
@@ -373,7 +373,7 @@ func (rt *Router) alertRuleAddForService(lst []models.AlertRule, username string
 	return reterr
 }
 
-func (rt *Router) alertRuleAdd(lst []models.AlertRule, username string, bgid int64, lang string) map[string]string {
+func (rt *Router) alertRuleAdd(c *gin.Context, lst []models.AlertRule, username string, bgid int64, lang string) map[string]string {
 	count := len(lst)
 	// alert rule name -> error string
 	reterr := make(map[string]string)
@@ -383,6 +383,11 @@ func (rt *Router) alertRuleAdd(lst []models.AlertRule, username string, bgid int
 		if username != "" {
 			lst[i].CreateBy = username
 			lst[i].UpdateBy = username
+		}
+
+		if err := RuleChangeHook(c, &lst[i]); err != nil {
+			reterr[lst[i].Name] = translateText(lang, err.Error())
+			continue
 		}
 
 		if err := lst[i].FE2DB(); err != nil {
@@ -401,7 +406,7 @@ func (rt *Router) alertRuleAdd(lst []models.AlertRule, username string, bgid int
 
 // alertRuleUpsert 与 alertRuleAdd 对位，命中同名则覆盖；用于 force=true 的导入路径。
 // 注意：FE2DB 由 Upsert 内部按分支调用，这里不要预调用，否则覆盖分支会双调 FE2DB 污染累加型字段（如 EnableDaysOfWeek）。
-func (rt *Router) alertRuleUpsert(lst []models.AlertRule, username string, bgid int64, lang string) map[string]string {
+func (rt *Router) alertRuleUpsert(c *gin.Context, lst []models.AlertRule, username string, bgid int64, lang string) map[string]string {
 	count := len(lst)
 	reterr := make(map[string]string)
 	for i := 0; i < count; i++ {
@@ -410,6 +415,11 @@ func (rt *Router) alertRuleUpsert(lst []models.AlertRule, username string, bgid 
 		if username != "" {
 			lst[i].CreateBy = username // 仅插入路径生效，覆盖路径会被 existing.CreateBy 还原
 			lst[i].UpdateBy = username
+		}
+
+		if err := RuleChangeHook(c, &lst[i]); err != nil {
+			reterr[lst[i].Name] = translateText(lang, err.Error())
+			continue
 		}
 
 		if err := lst[i].Upsert(rt.Ctx); err != nil {
@@ -451,6 +461,10 @@ func (rt *Router) alertRulePutByFE(c *gin.Context) {
 	}
 
 	rt.bgrwCheck(c, ar.GroupId)
+
+	if err := RuleChangeHook(c, &f); err != nil {
+		ginx.Bomb(http.StatusForbidden, "%s", err.Error())
+	}
 
 	f.UpdateBy = c.MustGet("username").(string)
 	ginx.NewRender(c).Message(ar.Update(rt.Ctx, f))
@@ -497,7 +511,10 @@ func (rt *Router) alertRulePutFields(c *gin.Context) {
 			continue
 		}
 
-		if f.Action == "update_triggers" {
+		// 特殊 action 会在原有内容基础上做合并/追加/删除，处理完后必须跳过下面的通用字段写入，
+		// 否则通用流程会用本次提交的原始内容再覆盖一次，导致上面的合并结果丢失（新增变覆盖、删除变只留删除项）。
+		switch f.Action {
+		case "update_triggers":
 			if triggers, has := f.Fields["triggers"]; has {
 				originRule := ar.RuleConfigJson.(map[string]interface{})
 				originRule["triggers"] = triggers
@@ -505,9 +522,8 @@ func (rt *Router) alertRulePutFields(c *gin.Context) {
 				ginx.Dangerous(err)
 				ginx.Dangerous(ar.UpdateFieldsMap(rt.Ctx, map[string]interface{}{"rule_config": string(b)}))
 			}
-		}
 
-		if f.Action == "annotations_add" {
+		case "annotations_add":
 			if annotations, has := f.Fields["annotations"]; has {
 				annotationsMap := annotations.(map[string]interface{})
 				for k, v := range annotationsMap {
@@ -517,9 +533,8 @@ func (rt *Router) alertRulePutFields(c *gin.Context) {
 				ginx.Dangerous(err)
 				ginx.Dangerous(ar.UpdateFieldsMap(rt.Ctx, map[string]interface{}{"annotations": string(b)}))
 			}
-		}
 
-		if f.Action == "annotations_del" {
+		case "annotations_del":
 			if annotations, has := f.Fields["annotations"]; has {
 				annotationsKeys := annotations.(map[string]interface{})
 				for key := range annotationsKeys {
@@ -529,9 +544,8 @@ func (rt *Router) alertRulePutFields(c *gin.Context) {
 				ginx.Dangerous(err)
 				ginx.Dangerous(ar.UpdateFieldsMap(rt.Ctx, map[string]interface{}{"annotations": string(b)}))
 			}
-		}
 
-		if f.Action == "callback_add" {
+		case "callback_add":
 			// 增加一个 callback 地址
 			if callbacks, has := f.Fields["callbacks"]; has {
 				callback := callbacks.(string)
@@ -539,35 +553,35 @@ func (rt *Router) alertRulePutFields(c *gin.Context) {
 					ginx.Dangerous(ar.UpdateFieldsMap(rt.Ctx, map[string]interface{}{"callbacks": ar.Callbacks + " " + callback}))
 				}
 			}
-		}
 
-		if f.Action == "callback_del" {
+		case "callback_del":
 			// 删除一个 callback 地址
 			if callbacks, has := f.Fields["callbacks"]; has {
 				callback := callbacks.(string)
 				ginx.Dangerous(ar.UpdateFieldsMap(rt.Ctx, map[string]interface{}{"callbacks": strings.ReplaceAll(ar.Callbacks, callback, "")}))
 			}
-		}
 
-		if f.Action == "datasource_change" {
+		case "datasource_change":
 			// 修改数据源
 			if datasourceQueries, has := f.Fields["datasource_queries"]; has {
 				bytes, err := json.Marshal(datasourceQueries)
 				ginx.Dangerous(err)
 				ginx.Dangerous(ar.UpdateFieldsMap(rt.Ctx, map[string]interface{}{"datasource_queries": bytes}))
 			}
-		}
 
-		for k, v := range f.Fields {
-			// 检查 v 是否为各种切片类型
-			switch v.(type) {
-			case []interface{}, []int64, []int, []string:
-				// 将切片转换为 JSON 字符串
-				bytes, err := json.Marshal(v)
-				ginx.Dangerous(err)
-				ginx.Dangerous(ar.UpdateColumn(rt.Ctx, k, string(bytes)))
-			default:
-				ginx.Dangerous(ar.UpdateColumn(rt.Ctx, k, v))
+		default:
+			// 通用字段整体覆盖（对应前端 cover 模式及无特殊 action 的普通批量更新）
+			for k, v := range f.Fields {
+				// 检查 v 是否为各种切片类型
+				switch v.(type) {
+				case []interface{}, []int64, []int, []string:
+					// 将切片转换为 JSON 字符串
+					bytes, err := json.Marshal(v)
+					ginx.Dangerous(err)
+					ginx.Dangerous(ar.UpdateColumn(rt.Ctx, k, string(bytes)))
+				default:
+					ginx.Dangerous(ar.UpdateColumn(rt.Ctx, k, v))
+				}
 			}
 		}
 

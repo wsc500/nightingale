@@ -4,10 +4,10 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/ccfos/nightingale/v6/aiagent/llm"
-	"github.com/ccfos/nightingale/v6/aiagent/mcp"
 	"github.com/toolkits/pkg/logger"
 )
 
@@ -105,17 +105,17 @@ func (a *Agent) Run(ctx context.Context, req *AgentRequest) (*AgentResponse, err
 	}
 	tSkillElapsed := time.Since(tSkillStart)
 
-	// 构造本次 Run 的工具表：cfg.Tools 作只读种子 → 追加 skill 工具 → 追加 MCP 工具
+	// 构造本次 Run 的工具表：cfg.Tools 作只读种子 → 追加 skill 工具 → 追加外部工具源工具
 	tToolStart := time.Now()
 	tools := append([]AgentTool(nil), a.cfg.Tools...)
 	tools = a.appendSkillTools(tools, activeSkills)
-	mcpToolCount := 0
-	if a.mcpClientManager != nil && len(a.mcpServers) > 0 {
-		mcpCtx, mcpCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	srcToolCount := 0
+	if len(a.cfg.ToolSources) > 0 {
+		srcCtx, srcCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		before := len(tools)
-		tools = a.appendMCPTools(mcpCtx, tools)
-		mcpCancel()
-		mcpToolCount = len(tools) - before
+		tools = a.appendSourceTools(srcCtx, tools)
+		srcCancel()
+		srcToolCount = len(tools) - before
 	}
 	// 按需技能加载：技能子系统开启时挂 load_skill 工具，配合系统提示词里常驻的
 	// 「可用技能目录」（appendSkillCatalog），agent 可在运行中自取所需技能；
@@ -138,9 +138,9 @@ func (a *Agent) Run(ctx context.Context, req *AgentRequest) (*AgentResponse, err
 		}
 	}
 
-	logger.Infof("[Agent] preparation: skills=%dms (n=%d) tools=%dms (mcp_added=%d total=%d)",
+	logger.Infof("[Agent] preparation: skills=%dms (n=%d) tools=%dms (external_added=%d total=%d)",
 		tSkillElapsed.Milliseconds(), len(activeSkills),
-		time.Since(tToolStart).Milliseconds(), mcpToolCount, len(tools))
+		time.Since(tToolStart).Milliseconds(), srcToolCount, len(tools))
 
 	rc := &runCtx{skills: activeSkills, tools: tools}
 
@@ -211,17 +211,23 @@ func (a *Agent) applyDefaults() {
 	if cfg.OutputField == "" {
 		cfg.OutputField = "ai_analysis"
 	}
+}
 
-	// MCP 初始化
-	if cfg.MCP != nil && len(cfg.MCP.Servers) > 0 {
-		a.mcpClientManager = mcp.NewClientManager()
-		a.mcpServers = make(map[string]*mcp.ServerConfig)
-		for i := range cfg.MCP.Servers {
-			server := &cfg.MCP.Servers[i]
-			a.mcpServers[server.Name] = server
-		}
-		logger.Infof("AI Agent MCP initialized: %d servers configured", len(cfg.MCP.Servers))
+// isSkillHidden 报告名为 name 的私有 skill 是否对本次请求用户不可见（未授权）。
+// 与 ToolDeps.IsSkillHidden 同源，覆盖 Agent 内部按名取用 skill 的各条路径。
+func (a *Agent) isSkillHidden(name string) bool {
+	if a.cfg == nil || a.cfg.Skills == nil {
+		return false
 	}
+	if a.cfg.Skills.DenyAllSkills {
+		return true
+	}
+	for _, n := range a.cfg.Skills.HiddenSkillNames {
+		if n == name {
+			return true
+		}
+	}
+	return false
 }
 
 // loadPinnedSkills 加载显式预载的技能（SkillNames：action RequiredSkills / agent
@@ -234,6 +240,11 @@ func (a *Agent) loadPinnedSkills() []*SkillContent {
 
 	var activeSkills []*SkillContent
 	for _, name := range a.cfg.Skills.SkillNames {
+		// 私有 skill 对未授权用户不可见：即便被 agent/action 显式绑定也不预载其内容。
+		if a.isSkillHidden(name) {
+			logger.Warningf("Skill '%s' hidden from current user, skip preload", name)
+			continue
+		}
 		skill := a.skillRegistry.GetByName(name)
 		if skill == nil {
 			logger.Warningf("Skill '%s' not found", name)
@@ -289,6 +300,7 @@ func (a *Agent) appendSkillTools(base []AgentTool, skills []*SkillContent) []Age
 			for name := range toolDescriptions {
 				toolNames = append(toolNames, name)
 			}
+			sort.Strings(toolNames)
 		}
 
 		for _, toolName := range toolNames {

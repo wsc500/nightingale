@@ -376,7 +376,7 @@ ALTER TABLE `embedded_product` ADD COLUMN `hide` boolean not null default false;
 /* v9 2026-04-20 event_pipeline group_id */
 ALTER TABLE `event_pipeline` ADD COLUMN `group_id` bigint NOT NULL DEFAULT 0 COMMENT 'busi group id';
 
-/* v9 2026-04-20 AI agent: llm config / agent / skill / mcp server */
+/* v9 2026-04-20 AI agent: llm config / agent / skill */
 CREATE TABLE `ai_llm_config` (
     `id` bigint unsigned NOT NULL AUTO_INCREMENT,
     `name` varchar(255) NOT NULL DEFAULT '' COMMENT 'config name',
@@ -434,21 +434,8 @@ CREATE TABLE `ai_skill` (
 
 ALTER TABLE `ai_skill` ADD COLUMN `source_type` varchar(16) NOT NULL DEFAULT 'local' COMMENT 'skill source type: local/git' AFTER `enabled`;
 ALTER TABLE `ai_skill` ADD COLUMN `git_info` text COMMENT 'git source info (JSON)' AFTER `source_type`;
-
-CREATE TABLE `mcp_server` (
-    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
-    `name` varchar(255) NOT NULL DEFAULT '' COMMENT 'mcp server name',
-    `url` varchar(1024) NOT NULL DEFAULT '' COMMENT 'mcp server url',
-    `headers` text COMMENT 'request headers (JSON)',
-    `description` text COMMENT 'description',
-    `enabled` tinyint(1) NOT NULL DEFAULT 0 COMMENT 'enabled flag',
-    `created_at` bigint NOT NULL DEFAULT 0 COMMENT 'create time',
-    `created_by` varchar(64) NOT NULL DEFAULT '' COMMENT 'creator',
-    `updated_at` bigint NOT NULL DEFAULT 0 COMMENT 'update time',
-    `updated_by` varchar(64) NOT NULL DEFAULT '' COMMENT 'updater',
-    PRIMARY KEY (`id`),
-    KEY `idx_name` (`name`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='mcp servers';
+ALTER TABLE `ai_skill` ADD COLUMN `user_group_ids` text COMMENT 'authorized team ids (JSON array)' AFTER `enabled`;
+ALTER TABLE `ai_skill` ADD COLUMN `private` int NOT NULL DEFAULT 0 COMMENT 'auth scope: 0-public 1-private' AFTER `user_group_ids`;
 
 /* v9 2026-04-23 AI skill files */
 CREATE TABLE `ai_skill_file` (
@@ -492,3 +479,12 @@ CREATE TABLE `ai_assistant_message` (
 
 /* v9 2026-06-25 es_index_pattern weight for sorting */
 ALTER TABLE `es_index_pattern` ADD COLUMN `weight` int not null default 0;
+
+/* v9 2026-07-06 message_template lang for i18n */
+ALTER TABLE `message_template` ADD COLUMN `lang` varchar(32) not null default '';
+
+/* v9 2026-07-10 alert_mute mute_type for notify-only mute */
+ALTER TABLE `alert_mute` ADD COLUMN `mute_type` int not null default 0 comment '0-mute event and notify,1-mute notify only';
+
+/* v9 2026-07-20 alert_his_event composite index for history query (large table: consider gh-ost/pt-osc) */
+ALTER TABLE `alert_his_event` ADD KEY `idx_group_last_eval_time` (`group_id`, `last_eval_time`);
