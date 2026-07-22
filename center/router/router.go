@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"path"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -156,6 +157,14 @@ func New(httpConfig httpx.Config, center cconf.Center, alert aconf.Alert, ibex c
 		if err := skill.ExtractBuiltin(skillsPath); err != nil {
 			logger.Warningf("extract builtin skills to %s failed: %v", skillsPath, err)
 		}
+		// QA 代码语料（仅 -tags qa_code_embed 构建内嵌，默认构建 no-op）：释放到
+		// skillsPath 父目录下的 code/（与 integrations/ 同级），list_code /
+		// search_code / read_code 工具以同一锚点定位。失败仅降级 QA，不致命。
+		if abs, err := filepath.Abs(skillsPath); err == nil {
+			if err := skill.ExtractCodeCorpus(filepath.Dir(abs)); err != nil {
+				logger.Warningf("extract QA code corpus failed: %v", err)
+			}
+		}
 	}
 
 	// Long-lived goroutine that materializes DB-backed skills onto disk. It
@@ -279,6 +288,13 @@ func (rt *Router) Config(r *gin.Engine) {
 			pages.POST("/iotdb-databases", rt.iotdbDatabases)
 			pages.POST("/iotdb-tables", rt.iotdbTables)
 			pages.POST("/iotdb-columns", rt.iotdbColumns)
+			pages.POST("/victorialogs-histogram", rt.QueryVictoriaLogsHistogram)
+			pages.POST("/victorialogs-field-names", rt.QueryVictoriaLogsFieldNames)
+			pages.POST("/victorialogs-field-values", rt.QueryVictoriaLogsFieldValues)
+			pages.POST("/loki-label-names", rt.QueryLokiLabelNames)
+			pages.POST("/loki-label-values", rt.QueryLokiLabelValues)
+			pages.POST("/loki-parsed-fields", rt.QueryLokiParsedFields)
+			pages.POST("/loki-histogram", rt.QueryLokiHistogram)
 
 			pages.POST("/log-query-batch", rt.QueryLogBatch)
 
@@ -309,6 +325,13 @@ func (rt *Router) Config(r *gin.Engine) {
 			pages.POST("/iotdb-databases", rt.auth(), rt.iotdbDatabases)
 			pages.POST("/iotdb-tables", rt.auth(), rt.iotdbTables)
 			pages.POST("/iotdb-columns", rt.auth(), rt.iotdbColumns)
+			pages.POST("/victorialogs-histogram", rt.auth(), rt.user(), rt.QueryVictoriaLogsHistogram)
+			pages.POST("/victorialogs-field-names", rt.auth(), rt.user(), rt.QueryVictoriaLogsFieldNames)
+			pages.POST("/victorialogs-field-values", rt.auth(), rt.user(), rt.QueryVictoriaLogsFieldValues)
+			pages.POST("/loki-label-names", rt.auth(), rt.user(), rt.QueryLokiLabelNames)
+			pages.POST("/loki-label-values", rt.auth(), rt.user(), rt.QueryLokiLabelValues)
+			pages.POST("/loki-parsed-fields", rt.auth(), rt.user(), rt.QueryLokiParsedFields)
+			pages.POST("/loki-histogram", rt.auth(), rt.user(), rt.QueryLokiHistogram)
 
 			pages.POST("/log-query-batch", rt.auth(), rt.user(), rt.QueryLogBatch)
 
@@ -436,6 +459,14 @@ func (rt *Router) Config(r *gin.Engine) {
 
 		pages.GET("/integrations/icon/:cate/:name", rt.builtinIcon)
 
+		// Categraf install helpers. Anonymous on purpose: the target machine
+		// runs these before it holds any credential, and none of the three
+		// returns anything the caller did not already supply or that is not
+		// public software. Same posture as /pub and /site-info.
+		pages.GET("/agents/categraf/meta", rt.categrafMeta)
+		pages.GET("/agents/categraf/install.sh", rt.categrafInstallScript)
+		pages.GET("/agents/categraf/download", rt.categrafDownload)
+
 		// pages.GET("/builtin-boards", rt.builtinBoardGets)
 		// pages.GET("/builtin-board/:name", rt.builtinBoardGet)
 		// pages.GET("/dashboards/builtin/list", rt.builtinBoardGets)
@@ -551,7 +582,7 @@ func (rt *Router) Config(r *gin.Engine) {
 		pages.GET("/busi-group/:id/tasks", rt.auth(), rt.user(), rt.perm("/job-tasks"), rt.bgro(), rt.taskGets)
 		pages.POST("/busi-group/:id/tasks", rt.auth(), rt.user(), rt.perm("/job-tasks/add"), rt.bgrw(), rt.taskAdd)
 
-		pages.GET("/servers", rt.auth(), rt.user(), rt.perm("/help/servers"), rt.serversGet)
+		pages.GET("/servers", rt.auth(), rt.user(), rt.perm("/system/alerting-engines"), rt.serversGet)
 		pages.GET("/server-clusters", rt.auth(), rt.user(), rt.serverClustersGet)
 
 		pages.POST("/datasource/list", rt.auth(), rt.user(), rt.datasourceList)
@@ -615,10 +646,10 @@ func (rt *Router) Config(r *gin.Engine) {
 		pages.PUT("/embedded-product/:id", rt.auth(), rt.user(), rt.perm("/embedded-product/put"), rt.embeddedProductPut)
 		pages.DELETE("/embedded-product/:id", rt.auth(), rt.user(), rt.perm("/embedded-product/delete"), rt.embeddedProductDelete)
 
-		pages.GET("/user-variable-configs", rt.auth(), rt.user(), rt.perm("/help/variable-configs"), rt.userVariableConfigGets)
-		pages.POST("/user-variable-config", rt.auth(), rt.user(), rt.perm("/help/variable-configs"), rt.userVariableConfigAdd)
-		pages.PUT("/user-variable-config/:id", rt.auth(), rt.user(), rt.perm("/help/variable-configs"), rt.userVariableConfigPut)
-		pages.DELETE("/user-variable-config/:id", rt.auth(), rt.user(), rt.perm("/help/variable-configs"), rt.userVariableConfigDel)
+		pages.GET("/user-variable-configs", rt.auth(), rt.user(), rt.perm("/system/variable-settings"), rt.userVariableConfigGets)
+		pages.POST("/user-variable-config", rt.auth(), rt.user(), rt.perm("/system/variable-settings"), rt.userVariableConfigAdd)
+		pages.PUT("/user-variable-config/:id", rt.auth(), rt.user(), rt.perm("/system/variable-settings"), rt.userVariableConfigPut)
+		pages.DELETE("/user-variable-config/:id", rt.auth(), rt.user(), rt.perm("/system/variable-settings"), rt.userVariableConfigDel)
 
 		pages.GET("/config", rt.auth(), rt.admin(), rt.configGetByKey)
 		pages.PUT("/config", rt.auth(), rt.admin(), rt.configPutByKey)
