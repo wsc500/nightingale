@@ -142,6 +142,18 @@ func (rt *Router) alertRuleAddByFE(c *gin.Context) {
 		ginx.Bomb(http.StatusBadRequest, "input json is empty")
 	}
 
+	// 生效时段非法是纯输入错误，先整体校验再逐条入库，避免前面几条已写库、后面一条才报错的半截结果。
+	// 一次收齐所有不合法的规则再报，批量提交时调用方才知道是哪几条出了问题。
+	var invalidTimes []string
+	for i := 0; i < count; i++ {
+		if err := lst[i].ValidateEffectiveTimes(); err != nil {
+			invalidTimes = append(invalidTimes, fmt.Sprintf("%s: %s", lst[i].Name, err.Error()))
+		}
+	}
+	if len(invalidTimes) > 0 {
+		ginx.Bomb(http.StatusBadRequest, "%s", strings.Join(invalidTimes, "; "))
+	}
+
 	bgid := ginx.UrlParamInt64(c, "id")
 	reterr := rt.alertRuleAdd(c, lst, username, bgid, c.GetHeader("X-Language"))
 
@@ -482,6 +494,7 @@ func (rt *Router) alertRulePutByService(c *gin.Context) {
 		ginx.NewRender(c, http.StatusNotFound).Message("No such AlertRule")
 		return
 	}
+
 	ginx.NewRender(c).Message(ar.Update(rt.Ctx, f))
 }
 
@@ -498,6 +511,20 @@ func (rt *Router) alertRulePutFields(c *gin.Context) {
 
 	if len(f.Fields) == 0 {
 		ginx.Bomb(http.StatusBadRequest, "fields empty")
+	}
+
+	// The generic branch below writes columns directly and bypasses AlertRule.Verify.
+	// An empty pattern is fine: the engine falls back to prom_eval_interval.
+	if v, ok := f.Fields["cron_pattern"]; ok {
+		pattern, isStr := v.(string)
+		if !isStr {
+			ginx.Bomb(http.StatusBadRequest, "cron_pattern must be a string")
+		}
+		if pattern != "" {
+			if err := models.ValidateCronPattern(pattern); err != nil {
+				ginx.Bomb(http.StatusBadRequest, "%s", err.Error())
+			}
+		}
 	}
 
 	updateBy := c.MustGet("username").(string)
@@ -520,6 +547,9 @@ func (rt *Router) alertRulePutFields(c *gin.Context) {
 				originRule["triggers"] = triggers
 				b, err := json.Marshal(originRule)
 				ginx.Dangerous(err)
+				candidate := *ar
+				candidate.RuleConfig = string(b)
+				ginx.Dangerous(candidate.ValidateRuleConfig(), http.StatusBadRequest)
 				ginx.Dangerous(ar.UpdateFieldsMap(rt.Ctx, map[string]interface{}{"rule_config": string(b)}))
 			}
 

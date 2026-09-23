@@ -130,7 +130,15 @@ func InitJWTSigningKey(ctx *ctx.Context) string {
 		log.Fatalln("init jwt signing key in mysql", err)
 	}
 
-	return key
+	// Re-read the stored value so all center instances converge on the SAME key even if
+	// they raced on a fresh database (each generated its own key and inserted a row).
+	// ConfigsGet returns a deterministic (lowest-id) row, so every instance now agrees.
+	val, err = ConfigsGet(ctx, JWT_SIGNING_KEY)
+	if err != nil {
+		log.Fatalln("init jwt signing key in mysql", err)
+	}
+
+	return val
 }
 
 // InitSalt generate random salt
@@ -167,7 +175,13 @@ func InitRSAPassWord(ctx *ctx.Context) (string, error) {
 	if err != nil {
 		return "", errors.WithMessage(err, "failed to set rsa password")
 	}
-	return pwd, nil
+
+	// Re-read so all center instances converge on the same value (see InitJWTSigningKey).
+	val, err = ConfigsGet(ctx, RSA_PASSWORD)
+	if err != nil {
+		return "", errors.WithMessage(err, "failed to get rsa password after set")
+	}
+	return val, nil
 }
 
 func ConfigsGet(ctx *ctx.Context, ckey string) (string, error) { //select built-in type configs
@@ -180,6 +194,7 @@ func ConfigsGet(ctx *ctx.Context, ckey string) (string, error) { //select built-
 	err := DB(ctx).Model(&Configs{}).
 		Where("ckey = ?", ckey).
 		Where(configExternalEq(0)).
+		Order("id").
 		Pluck("cval", &lst).Error
 	if err != nil {
 		return "", errors.WithMessage(err, "failed to query configs")
@@ -427,7 +442,7 @@ func ConfigsGetUserVariable(context *ctx.Context) ([]Configs, error) {
 func ConfigsUserVariableInsert(context *ctx.Context, conf Configs) error {
 	conf.External = ConfigExternal
 	conf.Id = 0
-	err := userVariableCheck(context, conf.Ckey, conf.Id)
+	err := userVariableCheck(context, conf.Ckey, conf.Id, "")
 	if err != nil {
 		return err
 	}
@@ -436,24 +451,33 @@ func ConfigsUserVariableInsert(context *ctx.Context, conf Configs) error {
 }
 
 func ConfigsUserVariableUpdate(context *ctx.Context, conf Configs) error {
-	err := userVariableCheck(context, conf.Ckey, conf.Id)
-	if err != nil {
-		return err
-	}
 	configOld, _ := ConfigGet(context, conf.Id)
 	if configOld == nil || configOld.External != ConfigExternal { //not valid id
 		return fmt.Errorf("not valid configs(id)")
 	}
+
+	err := userVariableCheck(context, conf.Ckey, conf.Id, configOld.Ckey)
+	if err != nil {
+		return err
+	}
+
 	return DB(context).Model(&Configs{Id: conf.Id}).Select(
 		"ckey", "cval", "note", "encrypted", "update_by", "update_at").Updates(conf).Error
 }
+
+// TplReservedKeys 是通知媒介模板渲染上下文中的内置顶层 key
+// （见 alert/sender/provider.buildNotifyTplData），用户变量不能占用这些名字。
+// 导出是为了让 provider 包用一条测试锁住两边的一致性——models 不能反向 import provider。
+var TplReservedKeys = []string{"tpl", "event", "events", "params", "sendto", "sendtos"}
 
 func isCStyleIdentifier(str string) bool {
 	regex := regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 	return regex.MatchString(str)
 }
 
-func userVariableCheck(context *ctx.Context, ckey string, id int64) error {
+// oldCkey 是这条变量在库里的现有名字，新建时传空串。保留字只在名字真的发生变化时才校验，
+// 存量库里早于该校验写入的同名变量因此仍然能正常编辑其它字段。
+func userVariableCheck(context *ctx.Context, ckey string, id int64, oldCkey string) error {
 	var objs []*Configs
 	var err error
 	if !isCStyleIdentifier(ckey) {
@@ -465,6 +489,16 @@ func userVariableCheck(context *ctx.Context, ckey string, id int64) error {
 	for _, word := range words {
 		if ckey == word {
 			return fmt.Errorf("invalid key(%q), reserved words, please use other key", ckey)
+		}
+	}
+
+	// 通知媒介的模板上下文里这些是内置顶层 key，同名变量在渲染时会被内置值盖掉、
+	// 静默失效，所以取名时就拦下来。
+	if ckey != oldCkey {
+		for _, word := range TplReservedKeys {
+			if ckey == word {
+				return fmt.Errorf("invalid key(%q), reserved words, please use other key", ckey)
+			}
 		}
 	}
 

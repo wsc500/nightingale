@@ -128,10 +128,12 @@ func (e *AlertHisEvent) FillNotifyGroups(ctx *ctx.Context, cache map[int64]*User
 
 // alertHisEventSession 构造历史告警列表/计数共用的过滤条件。
 // 过滤和排序统一使用 last_eval_time，与 idx_last_eval_time、
-// idx_group_last_eval_time 两个索引配合，避免过滤列与排序列不一致导致的 filesort
+// idx_group_last_eval_time 两个索引配合，避免过滤列与排序列不一致导致的 filesort。
+// scopes 供上层追加标准条件之外的过滤（如按通知记录子查询限定事件范围），
+// 立即求值而不用 gorm 的 Scopes：后者延迟到执行时才应用，与 Count 之类的复用不好配合
 func alertHisEventSession(ctx *ctx.Context, prods []string, bgids []int64, stime, etime int64,
 	severity int, recovered int, dsIds []int64, cates []string, ruleId int64, query string,
-	eventIds []int64) *gorm.DB {
+	eventIds []int64, scopes ...func(*gorm.DB) *gorm.DB) *gorm.DB {
 	session := DB(ctx).Model(&AlertHisEvent{}).Where("last_eval_time between ? and ?", stime, etime)
 
 	if len(prods) > 0 {
@@ -174,19 +176,24 @@ func alertHisEventSession(ctx *ctx.Context, prods []string, bgids []int64, stime
 		}
 	}
 
+	for _, scope := range scopes {
+		session = scope(session)
+	}
+
 	return session
 }
 
 func AlertHisEventTotal(
 	ctx *ctx.Context, prods []string, bgids []int64, stime, etime int64, severity int,
-	recovered int, dsIds []int64, cates []string, ruleId int64, query string, eventIds []int64) (int64, error) {
-	return Count(alertHisEventSession(ctx, prods, bgids, stime, etime, severity, recovered, dsIds, cates, ruleId, query, eventIds))
+	recovered int, dsIds []int64, cates []string, ruleId int64, query string, eventIds []int64,
+	scopes ...func(*gorm.DB) *gorm.DB) (int64, error) {
+	return Count(alertHisEventSession(ctx, prods, bgids, stime, etime, severity, recovered, dsIds, cates, ruleId, query, eventIds, scopes...))
 }
 
 func AlertHisEventGets(ctx *ctx.Context, prods []string, bgids []int64, stime, etime int64,
 	severity int, recovered int, dsIds []int64, cates []string, ruleId int64, query string,
-	limit, offset int, eventIds []int64) ([]AlertHisEvent, error) {
-	session := alertHisEventSession(ctx, prods, bgids, stime, etime, severity, recovered, dsIds, cates, ruleId, query, eventIds)
+	limit, offset int, eventIds []int64, scopes ...func(*gorm.DB) *gorm.DB) ([]AlertHisEvent, error) {
+	session := alertHisEventSession(ctx, prods, bgids, stime, etime, severity, recovered, dsIds, cates, ruleId, query, eventIds, scopes...)
 
 	var lst []AlertHisEvent
 	err := session.Order("last_eval_time desc, id desc").Limit(limit).Offset(offset).Find(&lst).Error
@@ -204,8 +211,9 @@ func AlertHisEventGets(ctx *ctx.Context, prods []string, bgids []int64, stime, e
 // 深翻页时不做 OFFSET 扫描。游标取上一页最后一行的 last_eval_time 和 id
 func AlertHisEventGetsByCursor(ctx *ctx.Context, prods []string, bgids []int64, stime, etime int64,
 	severity int, recovered int, dsIds []int64, cates []string, ruleId int64, query string,
-	cursorTime, cursorId int64, limit int, eventIds []int64) ([]AlertHisEvent, error) {
-	session := alertHisEventSession(ctx, prods, bgids, stime, etime, severity, recovered, dsIds, cates, ruleId, query, eventIds)
+	cursorTime, cursorId int64, limit int, eventIds []int64,
+	scopes ...func(*gorm.DB) *gorm.DB) ([]AlertHisEvent, error) {
+	session := alertHisEventSession(ctx, prods, bgids, stime, etime, severity, recovered, dsIds, cates, ruleId, query, eventIds, scopes...)
 
 	if cursorTime > 0 && cursorId > 0 {
 		session = session.Where("last_eval_time < ? or (last_eval_time = ? and id < ?)", cursorTime, cursorTime, cursorId)
@@ -254,6 +262,17 @@ func AlertHisEventGetByHash(ctx *ctx.Context, hash string) (*AlertHisEvent, erro
 		return nil, nil
 	}
 	return lst[0], nil
+}
+
+// AlertHisEventHashScope 把历史告警列表限定为指定 hash 的事件，等值匹配走 alert_his_event 的 KEY(hash)。
+// 走 scopes 而不是给 AlertHisEventGets/Total 加位置参数：这几个函数在 n9e-plus 里也被调用
+// （go.mod 用 replace 指向本仓库），改签名会变成必须成对提交的跨仓改动；
+// 用 scope 还能让 hash 过滤天然只作用于显式传它的调用方，通知规则详情、聚合告警等复用路径不受影响。
+// hash 是否为空由调用方判断
+func AlertHisEventHashScope(hash string) func(*gorm.DB) *gorm.DB {
+	return func(db *gorm.DB) *gorm.DB {
+		return db.Where("hash = ?", hash)
+	}
 }
 
 // AlertHisEventBatchDelete 按 id 游标批量删除 last_eval_time 早于 timestamp 的历史事件，

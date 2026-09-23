@@ -22,6 +22,7 @@ import (
 	"github.com/ccfos/nightingale/v6/memsto"
 	"github.com/ccfos/nightingale/v6/models"
 	"github.com/ccfos/nightingale/v6/pkg/ctx"
+	"github.com/ccfos/nightingale/v6/pkg/evallog"
 	"github.com/ccfos/nightingale/v6/pkg/httpx"
 	"github.com/ccfos/nightingale/v6/pkg/logx"
 	"github.com/ccfos/nightingale/v6/pkg/macros"
@@ -30,6 +31,7 @@ import (
 	"github.com/ccfos/nightingale/v6/pushgw/writer"
 	"github.com/ccfos/nightingale/v6/storage"
 	"github.com/flashcatcloud/ibex/src/cmd/ibex"
+	"github.com/toolkits/pkg/logger"
 )
 
 func Initialize(configDir string, cryptoKey string) (func(), error) {
@@ -92,6 +94,10 @@ func Initialize(configDir string, cryptoKey string) (func(), error) {
 	httpClean := httpx.Init(config.HTTP, r)
 
 	return func() {
+		// evallog 的写入队列与各文件的 64KB 缓冲只有 Shutdown 会排空，
+		// 不调用就等于每次正常退出都丢掉最近一批评估记录——而重启前后恰恰最需要现场。
+		// 必须排在 logxClean 之前，否则刷盘阶段的告警日志也一并丢了。
+		evallog.Shutdown()
 		logxClean()
 		httpClean()
 	}, nil
@@ -104,10 +110,27 @@ func Start(alertc aconf.Alert, pushgwc pconf.Pushgw, syncStats *memsto.Stats, al
 	recordingRuleCache := memsto.NewRecordingRuleCache(ctx, syncStats)
 	targetsOfAlertRulesCache := memsto.NewTargetOfAlertRuleCache(ctx, alertc.Heartbeat.EngineName, syncStats)
 
+	// 评估执行记录：本地文件存储，支持按规则+时间范围查询评估现场
+	if err := evallog.Init(alertc.EvalLog, evallog.Hooks{
+		OnDrop:        func() { alertStats.CounterEvalLogDropTotal.Inc() },
+		OnQueryReject: func() { alertStats.CounterEvalLogQueryRejectTotal.Inc() },
+	}); err != nil {
+		logger.Errorf("failed to init evallog: %v", err)
+	}
+
 	go models.InitNotifyConfig(ctx, alertc.Alerting.TemplatesDir)
 	go models.InitMessageTemplate(ctx)
 	go models.InitNotifyChannel(ctx)
 	models.VerifyByProvider = provider.VerifyChannelConfig
+
+	// 通知媒介的 URL / 请求头 / 查询参数 / 请求体可以引用「变量配置」里的变量（{{.my_token}}），
+	// 凭证因此不必明文写在媒介配置里。这里把变量缓存挂给 provider 包，避免为传递变量去改
+	// BuildNotifyContext / SendByNotifyRule 的签名（后者 n9e-plus 侧有自己的实现）。
+	// 开源的 center / 独立 alert / edge 都经由本函数启动，注册一次即覆盖；n9e-plus 不调用
+	// 本函数，需在其 plus.go 与 alert.Start 里各自注册，否则变量静默渲染成空串。
+	if notifyConfigCache != nil && notifyConfigCache.ConfigCache != nil {
+		provider.UserVariableGetter = notifyConfigCache.ConfigCache.Get
+	}
 
 	naming := naming.NewNaming(ctx, alertc.Heartbeat, alertStats)
 	// TODO(dingtalkapp): 钉钉应用本次不上线，先屏蔽 Stream 主备选举入口，避免启动回调长连接；待上线时恢复本行。

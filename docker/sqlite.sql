@@ -9,6 +9,7 @@ CREATE TABLE `users` (
     `roles` varchar(255) not null,
     `contacts` varchar(1024),
     `maintainer` tinyint(1) not null default 0,
+    `disabled` int not null default 0,
     `belong` varchar(16) not null default '',
     `last_active_time` bigint not null default 0,
     `create_at` bigint not null default 0,
@@ -510,6 +511,7 @@ CREATE INDEX idx_uuid ON `builtin_payloads` (uuid);
 
 CREATE TABLE `notification_record` (
     `id` integer primary key autoincrement,
+    `notify_rule_id` integer not null default 0,
     `event_id` integer not null,
     `sub_id` integer,
     `channel` varchar(255) not null,
@@ -519,6 +521,8 @@ CREATE TABLE `notification_record` (
     `created_at` integer not null
 );
 CREATE INDEX idx_evt ON notification_record (event_id);
+CREATE INDEX idx_nr_rule_created_evt ON notification_record (notify_rule_id, created_at, event_id);
+CREATE INDEX idx_nr_created_at ON notification_record (created_at);
 
 CREATE TABLE `task_tpl` (
     `id`        integer primary key autoincrement,

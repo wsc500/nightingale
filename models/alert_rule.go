@@ -3,6 +3,7 @@ package models
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/jinzhu/copier"
 	"github.com/pkg/errors"
+	"github.com/prometheus/common/model"
 	"github.com/tidwall/match"
 	"github.com/toolkits/pkg/logger"
 	"github.com/toolkits/pkg/str"
@@ -156,6 +158,46 @@ func (v VarConfig) MarshalJSON() ([]byte, error) {
 	}
 	type Alias VarConfig
 	return json.Marshal(Alias(v))
+}
+
+// ruleConfigArrayKeys 是 rule_config 里语义上是数组的 key。
+// v8.x 的类型化 marshal（老式 prom_ql 入参、Prom YAML 导入、v5 升 v6）会把这些 key 写成 null 落库，
+// 前端编辑页拿到后原样回传，null 就一直留在库里；API 消费方对 null 和 [] 的处理往往不同。
+// 对象类型的 key（如 child_var_configs）不在名单里：null 表示"没有下一层"，改成 {} 只会再套一层空。
+var ruleConfigArrayKeys = map[string]struct{}{
+	"queries":              {},
+	"triggers":             {},
+	"param_val":            {},
+	"joins":                {},
+	"on":                   {},
+	"task_tpls":            {},
+	"event_relabel_config": {},
+}
+
+// normalizeRuleConfigNulls 递归遍历 json.Unmarshal 到 interface{} 的 rule_config，
+// 把白名单 key 下的 null 改成空数组。只处理 map / slice，类型化结构体原样返回（它们自己的 MarshalJSON 已兜底）。
+// 就地修改并返回同一个值，方便链式赋值。
+func normalizeRuleConfigNulls(v interface{}) interface{} {
+	switch x := v.(type) {
+	case map[string]interface{}:
+		for k, val := range x {
+			if val == nil {
+				if _, ok := ruleConfigArrayKeys[k]; ok {
+					x[k] = []interface{}{}
+				}
+				continue
+			}
+			x[k] = normalizeRuleConfigNulls(val)
+		}
+		return x
+	case []interface{}:
+		for i := range x {
+			x[i] = normalizeRuleConfigNulls(x[i])
+		}
+		return x
+	default:
+		return v
+	}
 }
 
 // ParamQueryForFirst 同 ParamQuery，仅在第一层出现
@@ -567,6 +609,10 @@ func (ar *AlertRule) Verify() error {
 		return errors.New("rule_config is blank")
 	}
 
+	if err := ar.ValidateRuleConfig(); err != nil {
+		return err
+	}
+
 	if ar.PromEvalInterval <= 0 {
 		ar.PromEvalInterval = 15
 	}
@@ -624,7 +670,15 @@ func (ar *AlertRule) Verify() error {
 			enableStimeCount, enableEtimeCount, enableWeekCount)
 	}
 
+	if err := ar.ValidateEffectiveTimes(); err != nil {
+		return err
+	}
+
 	if err := ar.validateCronPattern(); err != nil {
+		return err
+	}
+
+	if err := ar.validateEventRelabelConfig(); err != nil {
 		return err
 	}
 
@@ -646,18 +700,237 @@ func (ar *AlertRule) Verify() error {
 	return nil
 }
 
+type alertRuleConfigForVerify struct {
+	Version  string `json:"version"`
+	Severity *int   `json:"severity"`
+	Queries  []struct {
+		PromQl   string `json:"prom_ql"`
+		Severity int    `json:"severity"`
+	} `json:"queries"`
+	ExpTriggerDisable bool `json:"exp_trigger_disable"`
+	Triggers          []struct {
+		Exp      string `json:"exp"`
+		Severity int    `json:"severity"`
+	} `json:"triggers"`
+	NodataTrigger struct {
+		Enable   bool `json:"enable"`
+		Severity int  `json:"severity"`
+	} `json:"nodata_trigger"`
+	AnomalyTrigger struct {
+		Enable   bool `json:"enable"`
+		Severity int  `json:"severity"`
+	} `json:"anomaly_trigger"`
+}
+
+func validateAlertRuleSeverity(field string, severity int) error {
+	if severity < SeverityEmergency || severity > SeverityNotice {
+		return fmt.Errorf("%s(%d) invalid: severity must be 1, 2 or 3", field, severity)
+	}
+	return nil
+}
+
+// ValidateRuleConfig checks the rule_config fields every alert event depends
+// on: severities must be 1, 2 or 3 and the query/trigger expressions must not
+// be blank. The top-level AlertRule.Severity and rule_config.severity are
+// legacy shadow fields and may legitimately be zero when a rule uses queries
+// or triggers. Non-zero values in those fields must still be valid severities.
+func (ar *AlertRule) ValidateRuleConfig() error {
+	if ar.Severity != 0 {
+		if err := validateAlertRuleSeverity("severity", ar.Severity); err != nil {
+			return err
+		}
+	}
+
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(ar.RuleConfig), &object); err != nil {
+		// RuleConfig is intentionally polymorphic. Other validators own its
+		// overall shape; this validation only applies to JSON objects.
+		return nil
+	}
+
+	var config alertRuleConfigForVerify
+	if err := json.Unmarshal([]byte(ar.RuleConfig), &config); err != nil {
+		return fmt.Errorf("invalid rule_config: %v", err)
+	}
+
+	// Host rules are keyed by prod, not cate: Verify defaults an empty cate to
+	// prometheus and the engine dispatches host rules by prod (GetRuleType), so
+	// classifying by cate alone would validate a host rule as prom v1.
+	isHost := ar.Prod == HOST || ar.Cate == HOST
+	isPromV1 := !isHost && (ar.Cate == PROMETHEUS || ar.Cate == LOKI) && config.Version != "v2"
+	legacyConfigSeverityActive := isPromV1 && len(config.Queries) == 0
+	if config.Severity != nil && (legacyConfigSeverityActive || *config.Severity != 0) {
+		if err := validateAlertRuleSeverity("rule_config.severity", *config.Severity); err != nil {
+			return err
+		}
+	}
+
+	// Skip the per-query checks when the anomaly trigger is enabled: legacy
+	// anomaly rules (n9e-plus, prod=anomaly) are migrated into queries that
+	// are algorithm inputs without prom_ql/severity — their event severity
+	// lives in anomaly_trigger and is validated below.
+	if isPromV1 && len(config.Queries) > 0 && !config.AnomalyTrigger.Enable {
+		for i := range config.Queries {
+			if strings.TrimSpace(config.Queries[i].PromQl) == "" {
+				return fmt.Errorf("rule_config.queries[%d].prom_ql is blank", i)
+			}
+			if err := validateAlertRuleSeverity(fmt.Sprintf("rule_config.queries[%d].severity", i), config.Queries[i].Severity); err != nil {
+				return err
+			}
+		}
+	} else if !isPromV1 {
+		// Host rules describe triggers with type/duration/percent instead of
+		// an expression, so the exp requirement only applies to other cates
+		// with threshold conditions enabled.
+		expRequired := !isHost && !config.ExpTriggerDisable
+		for i := range config.Triggers {
+			if expRequired && strings.TrimSpace(config.Triggers[i].Exp) == "" {
+				return fmt.Errorf("rule_config.triggers[%d].exp is blank", i)
+			}
+			if err := validateAlertRuleSeverity(fmt.Sprintf("rule_config.triggers[%d].severity", i), config.Triggers[i].Severity); err != nil {
+				return err
+			}
+		}
+	}
+
+	if config.NodataTrigger.Enable {
+		if err := validateAlertRuleSeverity("rule_config.nodata_trigger.severity", config.NodataTrigger.Severity); err != nil {
+			return err
+		}
+	}
+
+	if config.AnomalyTrigger.Enable {
+		if err := validateAlertRuleSeverity("rule_config.anomaly_trigger.severity", config.AnomalyTrigger.Severity); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// hhmmPattern 严格匹配 24 小时制 HH:MM。不接受 8:00 这类缺前导零的写法：生效时段在运行时是把
+// 当前时间格式化成 HH:MM 后按字符串直接比大小的，位数不齐会让时段判断出错。
+var hhmmPattern = regexp.MustCompile(`^([01][0-9]|2[0-3]):[0-5][0-9]$`)
+
+// hhmmEndPattern 在 HH:MM 之外额外放行结束时间 24:00：同样是字符串比大小，触发时刻最大只到 23:59，
+// 恒小于 24:00，所以 02:00-24:00 表示生效到当日结束，是 mute.go/dispatch.go 支持的既有写法。
+var hhmmEndPattern = regexp.MustCompile(`^([01][0-9]|2[0-3]):[0-5][0-9]$|^24:00$`)
+
+// ValidateEffectiveTimes 校验生效时段的起止时间格式。前端用 moment 格式化时间，moment 拿到脏数据
+// 会格式化出 「Invalid date」 这类字符串并原样提交，存进 DB 后按空格切分会让时段数组长度错乱。
+// 取值口径与上面的段数校验一致：复数字段为空时回退到已废弃的单数字段。
+func (ar *AlertRule) ValidateEffectiveTimes() error {
+	stimes := ar.EnableStimesJSON
+	if len(stimes) == 0 && ar.EnableStimeJSON != "" {
+		stimes = []string{ar.EnableStimeJSON}
+	}
+
+	etimes := ar.EnableEtimesJSON
+	if len(etimes) == 0 && ar.EnableEtimeJSON != "" {
+		etimes = []string{ar.EnableEtimeJSON}
+	}
+
+	for i := range stimes {
+		if !hhmmPattern.MatchString(stimes[i]) {
+			return fmt.Errorf("invalid effective time span %d: start time(%s) must be in HH:MM format", i+1, stimes[i])
+		}
+	}
+
+	for i := range etimes {
+		if !hhmmEndPattern.MatchString(etimes[i]) {
+			return fmt.Errorf("invalid effective time span %d: end time(%s) must be in HH:MM format", i+1, etimes[i])
+		}
+	}
+
+	return nil
+}
+
 func (ar *AlertRule) validateCronPattern() error {
 	if ar.CronPattern == "" {
 		return nil
 	}
 
-	// 创建一个临时的 cron scheduler 来验证表达式
-	scheduler := cron.New(cron.WithSeconds())
+	return ValidateCronPattern(ar.CronPattern)
+}
 
-	// 尝试添加一个空函数来验证 cron 表达式
-	_, err := scheduler.AddFunc(ar.CronPattern, func() {})
-	if err != nil {
-		return fmt.Errorf("invalid cron pattern: %s, error: %v", ar.CronPattern, err)
+// cronPatternParser must stay in sync with the schedulers the engine builds for
+// alert rules and recording rules: cron.New(cron.WithSeconds()).
+var cronPatternParser = cron.NewParser(
+	cron.Second | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor,
+)
+
+// ValidateCronPattern rejects patterns the engine cannot schedule,
+// e.g. the 5-field form without seconds.
+//
+// robfig/cron v3.0.1 panics instead of returning an error on a "TZ=xxx" spec
+// without a space (slice bounds out of range), so the parse is guarded.
+func ValidateCronPattern(pattern string) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("invalid cron pattern: %s, error: %v", pattern, r)
+		}
+	}()
+
+	if _, perr := cronPatternParser.Parse(pattern); perr != nil {
+		return fmt.Errorf("invalid cron pattern: %s, error: %v", pattern, perr)
+	}
+	return nil
+}
+
+// relabelConfigForVerify 用宽松类型接收 event_relabel_config，只为把非法 label name
+// 定位到具体第几条配置：直接解成 pconf.RelabelConfig 的话，它的 SourceLabels 是
+// model.LabelNames，遇到非法 label name 会中途中止，拿不到出错的下标。
+type relabelConfigForVerify struct {
+	SourceLabels []string `json:"source_labels"`
+}
+
+// validateEventRelabelConfig 保证 rule_config.event_relabel_config 能被读取端解开。
+// 读取端用的是 pconf.RelabelConfig，source_labels 里的非法 label name（空串、数字开头等）
+// 会让它的 UnmarshalJSON 失败：center 侧表现为 event_relabel_config 被静默改坏，edge 侧表现为
+// 整批告警规则同步失败、进程退出。字段类型不合法（如 modulus 传字符串）虽不会打挂
+// edge，但读取端同样整段丢弃，表现为"保存成功但 relabel 永远不生效"。两类都拦在写入口。
+func (ar *AlertRule) validateEventRelabelConfig() error {
+	if ar.RuleConfig == "" {
+		return nil
+	}
+
+	// 用 RawMessage 接住 relabel 段：rule_config 的整体结构由各 cate 自己定义，
+	// 这里只关心 relabel 部分，其余部分解不出来就不越权报错
+	var ruleConfig struct {
+		EventRelabelConfig json.RawMessage `json:"event_relabel_config"`
+	}
+	if err := json.Unmarshal([]byte(ar.RuleConfig), &ruleConfig); err != nil {
+		return nil
+	}
+
+	if len(ruleConfig.EventRelabelConfig) == 0 {
+		return nil
+	}
+
+	// 宽松类型解得开时，优先给出带下标的报错
+	var looseConfigs []*relabelConfigForVerify
+	if err := json.Unmarshal(ruleConfig.EventRelabelConfig, &looseConfigs); err == nil {
+		for i, cfg := range looseConfigs {
+			if cfg == nil {
+				continue
+			}
+
+			// 只校验 source_labels：它在读取端是 model.LabelNames，非法 label name 会让
+			// 反序列化失败。target_label 在读取端是普通 string，不参与反序列化校验，
+			// 且运行期 lowercase/uppercase/hashmod 等分支会原样写出（含点号的标签正是
+			// relabel.go 里 REPLACE_DOT 机制要支持的），所以这里不能收得比读取端更严。
+			for _, sourceLabel := range cfg.SourceLabels {
+				if !model.LabelName(sourceLabel).IsValid() {
+					return fmt.Errorf("event_relabel_config[%d]: %q is not a valid label name in source_labels", i, sourceLabel)
+				}
+			}
+		}
+	}
+
+	// 最后按读取端的真实类型解一遍，判定标准与 DB2FE 完全一致
+	var configs []*pconf.RelabelConfig
+	if err := json.Unmarshal(ruleConfig.EventRelabelConfig, &configs); err != nil {
+		return fmt.Errorf("invalid event_relabel_config: %v", err)
 	}
 
 	return nil
@@ -747,7 +1020,14 @@ func (ar *AlertRule) UpdateColumn(ctx *ctx.Context, column string, value interfa
 	}
 
 	if column == "severity" {
-		severity := int(value.(float64))
+		severityValue, ok := value.(float64)
+		if !ok || severityValue != float64(int(severityValue)) {
+			return fmt.Errorf("severity(%v) invalid: severity must be 1, 2 or 3", value)
+		}
+		severity := int(severityValue)
+		if err := validateAlertRuleSeverity("severity", severity); err != nil {
+			return err
+		}
 		if ar.Cate == PROMETHEUS {
 			var ruleConfig PromRuleConfig
 			err := json.Unmarshal([]byte(ar.RuleConfig), &ruleConfig)
@@ -1036,6 +1316,8 @@ func (ar *AlertRule) FE2DB() error {
 
 	// json.Marshal  RuleConfigJson
 	if ar.RuleConfigJson != nil {
+		// 写侧顺手洗掉前端回传的 null，新落库的数据不再带 null（读侧 DB2FE 仍会兜底存量）
+		ar.RuleConfigJson = normalizeRuleConfigNulls(ar.RuleConfigJson)
 		b, err := json.Marshal(ar.RuleConfigJson)
 		if err != nil {
 			return fmt.Errorf("marshal rule_config err:%v", err)
@@ -1091,13 +1373,28 @@ func (ar *AlertRule) DB2FE() error {
 	json.Unmarshal([]byte(ar.RuleConfig), &ar.RuleConfigJson)
 	json.Unmarshal([]byte(ar.Annotations), &ar.AnnotationsJSON)
 	json.Unmarshal([]byte(ar.ExtraConfig), &ar.ExtraConfigJSON)
+	// 存量 rule_config 里的 null 数组（如 var_config.param_val）统一归成 []
+	ar.RuleConfigJson = normalizeRuleConfigNulls(ar.RuleConfigJson)
 
 	// 解析 RuleConfig 字段
-	var ruleConfig struct {
-		EventRelabelConfig []*pconf.RelabelConfig `json:"event_relabel_config"`
+	// 空 rule_config 在老库里是存量数据（该列 text not null 无默认值），不是异常，直接跳过，
+	// 否则每次列表接口都会为这些行刷一条 Warning。
+	if ar.RuleConfig != "" {
+		var ruleConfig struct {
+			EventRelabelConfig []*pconf.RelabelConfig `json:"event_relabel_config"`
+		}
+		if err := json.Unmarshal([]byte(ar.RuleConfig), &ruleConfig); err != nil {
+			// 这里的错误不能吞：SourceLabels 是 model.LabelNames，遇到非法 label name 会
+			// 中途中止，留下一个被改坏的结构体（已扩容但未赋值的元素变成空串，报错位置之后的
+			// 字段全丢）。把这份数据发给 edge，edge 反序列化整批规则都会失败并退出进程，
+			// 所以宁可整段置空，也不能把伪造出来的值传下去。
+			logger.Warningf("alert rule(id=%d name=%s) decode event_relabel_config failed, dropped: %v",
+				ar.Id, ar.Name, err)
+			ar.EventRelabelConfig = nil
+		} else {
+			ar.EventRelabelConfig = ruleConfig.EventRelabelConfig
+		}
 	}
-	json.Unmarshal([]byte(ar.RuleConfig), &ruleConfig)
-	ar.EventRelabelConfig = ruleConfig.EventRelabelConfig
 
 	// 兼容旧逻辑填充 cron_pattern
 	if ar.CronPattern == "" && ar.PromEvalInterval != 0 {
@@ -1110,6 +1407,26 @@ func (ar *AlertRule) DB2FE() error {
 	}
 
 	ar.FillSeverities()
+
+	// 数组 / map 字段对外统一返回 [] / {}，不返回 null：
+	// serializer:json 列为空、gorm:"-" 的派生字段没填、annotations 列为空串时这些字段都是 nil。
+	// Go 侧消费者（edge 同步、引擎）对 nil 和空切片的处理完全一致，只影响 JSON 形状。
+	if ar.DatasourceQueries == nil {
+		ar.DatasourceQueries = []DatasourceQuery{}
+	}
+	if ar.EventRelabelConfig == nil {
+		ar.EventRelabelConfig = []*pconf.RelabelConfig{}
+	}
+	if ar.NotifyGroupsObj == nil {
+		ar.NotifyGroupsObj = []UserGroup{}
+	}
+	// pipeline_configs 与 severities 故意不归一：这两个字段前端都是用真值兜底的，[] 是真值、null 才是假值，归一会让兜底失效。
+	// pipeline_configs：编辑页 `pipeline_configs ?? [{enable:true}]` 靠 null 出默认工作流行，[] 会让工作流区空白且无法添加。
+	// severities：列表页筛选是 `(item.severities && ...) || !item.severities`，[] 会让推不出严重度的规则整条从列表消失
+	// （rule_config 为空串、或非 prom 规则 triggers 为空时 FillSeverities 一个都 append 不出来）。该字段 gorm:"-" 且只给前端用。
+	if ar.AnnotationsJSON == nil {
+		ar.AnnotationsJSON = map[string]string{}
+	}
 
 	return nil
 }
@@ -1219,16 +1536,53 @@ func AlertRuleGetsLegacyNotifyByBGIds(ctx *ctx.Context, bgids []int64, includeDi
 	return lst, err
 }
 
+// rawAlertRule 与 json.RawMessage 一样延迟解码，额外实现 String()，
+// 避免 poster 里 %+v 的 debug 日志把整批规则打成字节十进制数组。
+type rawAlertRule []byte
+
+func (r *rawAlertRule) UnmarshalJSON(b []byte) error {
+	*r = append((*r)[:0], b...)
+	return nil
+}
+
+func (r rawAlertRule) String() string {
+	return string(r)
+}
+
 func AlertRuleGetsAll(ctx *ctx.Context) ([]*AlertRule, error) {
 	if !ctx.IsCenter {
-		lst, err := poster.GetByUrls[[]*AlertRule](ctx, "/v1/n9e/alert-rules?disabled=0")
+		// 逐条反序列化，而不是一次解成 []*AlertRule：单条规则里的脏数据（例如
+		// event_relabel_config 里的非法 label name）会让整个响应解码失败，进而
+		// 导致边缘机房一条规则都同步不到、启动阶段直接 exit。坏规则跳过并告警，
+		// 其余规则照常生效。
+		raws, err := poster.GetByUrls[[]rawAlertRule](ctx, "/v1/n9e/alert-rules?disabled=0")
 		if err != nil {
 			return nil, err
 		}
-		for i := 0; i < len(lst); i++ {
-			lst[i].FE2DB()
+
+		lst := make([]*AlertRule, 0, len(raws))
+		for i := 0; i < len(raws); i++ {
+			var ar AlertRule
+			if err := json.Unmarshal(raws[i], &ar); err != nil {
+				logger.Errorf("failed to decode alert rule, skipped: %v, raw: %s", err, string(raws[i]))
+				continue
+			}
+			ar.FE2DB()
+			lst = append(lst, &ar)
 		}
-		return lst, err
+
+		if skipped := len(raws) - len(lst); skipped > 0 {
+			logger.Errorf("%d of %d alert rules skipped due to decode failure", skipped, len(raws))
+		}
+
+		// 一条都没解出来，说明不是个别脏数据而是响应整体不可用（如 center 与 edge 版本不一致）。
+		// 此时必须返回 error：调用方据此保留旧缓存并继续重试，否则规则缓存会被清空、
+		// 同步水位又被刷成最新，告警全停且不再重试。
+		if len(raws) > 0 && len(lst) == 0 {
+			return nil, fmt.Errorf("all %d alert rules failed to decode", len(raws))
+		}
+
+		return lst, nil
 	}
 
 	session := DB(ctx).Where("disabled = ?", 0)
