@@ -1,9 +1,14 @@
 package models
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/ccfos/nightingale/v6/pkg/ctx"
 	"gorm.io/gorm"
@@ -11,15 +16,18 @@ import (
 
 // 所有列都显式声明类型，与 docker/migratesql/migrate.sql 保持一致，理由同 AILLMConfig。
 type AISkillFile struct {
-	Id        int64  `json:"id" gorm:"primaryKey;autoIncrement"`
-	SkillId   int64  `json:"skill_id" gorm:"type:bigint;not null;default:0;index:idx_skill_id"`
-	Name      string `json:"name" gorm:"type:varchar(255);not null;default:''"`
-	Content   string `json:"content" gorm:"type:mediumtext"`
-	Size      int64  `json:"size" gorm:"type:bigint;not null;default:0"`
-	CreatedAt int64  `json:"created_at" gorm:"type:bigint;not null;default:0"`
-	CreatedBy string `json:"created_by" gorm:"type:varchar(64);not null;default:''"`
-	UpdatedAt int64  `json:"updated_at" gorm:"type:bigint;not null;default:0"`
-	UpdatedBy string `json:"updated_by" gorm:"type:varchar(64);not null;default:''"`
+	Id          int64  `json:"id" gorm:"primaryKey;autoIncrement"`
+	SkillId     int64  `json:"skill_id" gorm:"type:bigint;not null;default:0;index:idx_skill_id"`
+	Name        string `json:"name" gorm:"type:varchar(255);not null;default:''"`
+	Content     string `json:"content" gorm:"type:mediumtext;->"`
+	ContentBlob []byte `json:"-" gorm:"type:longblob"`
+	IsBinary    bool   `json:"is_binary" gorm:"type:boolean;not null;default:false"`
+	ContentHash string `json:"content_hash,omitempty" gorm:"type:varchar(64);not null;default:''"`
+	Size        int64  `json:"size" gorm:"type:bigint;not null;default:0"`
+	CreatedAt   int64  `json:"created_at" gorm:"type:bigint;not null;default:0"`
+	CreatedBy   string `json:"created_by" gorm:"type:varchar(64);not null;default:''"`
+	UpdatedAt   int64  `json:"updated_at" gorm:"type:bigint;not null;default:0"`
+	UpdatedBy   string `json:"updated_by" gorm:"type:varchar(64);not null;default:''"`
 }
 
 func (f *AISkillFile) TableName() string {
@@ -33,27 +41,109 @@ func (f *AISkillFile) TableName() string {
 // and kept here as a safe fallback for code paths that run before injection.
 var MaxFilesPerSkill = 1000
 
+const (
+	MaxSkillBinaryFileSize = 500 * 1024 * 1024
+	MaxSkillTextFileSize   = 16 * 1024 * 1024
+	MaxSkillMDSize         = 64 * 1024
+)
+
+// IsBinarySkillContent identifies bytes that cannot be returned as plain UTF-8 text.
+func IsBinarySkillContent(content string) bool {
+	return !utf8.ValidString(content) || strings.IndexByte(content, 0) >= 0
+}
+
+// ValidateAISkillFileSize is shared by import, database writes, and disk sync.
+func ValidateAISkillFileSize(name string, size int64, isBinary bool) error {
+	if name == "SKILL.md" {
+		if size > MaxSkillMDSize {
+			return fmt.Errorf("SKILL.md exceeds %dKB limit (%d bytes)", MaxSkillMDSize/1024, size)
+		}
+		return nil
+	}
+	limit := int64(MaxSkillTextFileSize)
+	if isBinary {
+		limit = MaxSkillBinaryFileSize
+	}
+	if size > limit {
+		return fmt.Errorf("file %s exceeds %dMB limit (%d bytes)", name, limit/1024/1024, size)
+	}
+	return nil
+}
+
 // PostgresAISkillFile is the PostgreSQL-compatible variant of AISkillFile.
 // PostgreSQL does not support mediumtext; its text type is unlimited.
 type PostgresAISkillFile struct {
-	Id        int64  `json:"id" gorm:"primaryKey;autoIncrement"`
-	SkillId   int64  `json:"skill_id" gorm:"type:bigint;not null;default:0;index:idx_skill_id"`
-	Name      string `json:"name" gorm:"type:varchar(255);not null;default:''"`
-	Content   string `json:"content" gorm:"type:text"`
-	Size      int64  `json:"size" gorm:"type:bigint;not null;default:0"`
-	CreatedAt int64  `json:"created_at" gorm:"type:bigint;not null;default:0"`
-	CreatedBy string `json:"created_by" gorm:"type:varchar(64);not null;default:''"`
-	UpdatedAt int64  `json:"updated_at" gorm:"type:bigint;not null;default:0"`
-	UpdatedBy string `json:"updated_by" gorm:"type:varchar(64);not null;default:''"`
+	Id          int64  `json:"id" gorm:"primaryKey;autoIncrement"`
+	SkillId     int64  `json:"skill_id" gorm:"type:bigint;not null;default:0;index:idx_skill_id"`
+	Name        string `json:"name" gorm:"type:varchar(255);not null;default:''"`
+	Content     string `json:"content" gorm:"type:text;->"`
+	ContentBlob []byte `json:"-" gorm:"type:bytea"`
+	IsBinary    bool   `json:"is_binary" gorm:"type:boolean;not null;default:false"`
+	ContentHash string `json:"content_hash,omitempty" gorm:"type:varchar(64);not null;default:''"`
+	Size        int64  `json:"size" gorm:"type:bigint;not null;default:0"`
+	CreatedAt   int64  `json:"created_at" gorm:"type:bigint;not null;default:0"`
+	CreatedBy   string `json:"created_by" gorm:"type:varchar(64);not null;default:''"`
+	UpdatedAt   int64  `json:"updated_at" gorm:"type:bigint;not null;default:0"`
+	UpdatedBy   string `json:"updated_by" gorm:"type:varchar(64);not null;default:''"`
 }
 
 func (f *PostgresAISkillFile) TableName() string {
 	return "ai_skill_file"
 }
 
+// RawContent returns the original file bytes as a Go string. All new writes use
+// ContentBlob; legacy rows that only have Content still read unchanged.
+func (f *AISkillFile) RawContent() string {
+	if f.ContentBlob != nil {
+		return string(f.ContentBlob)
+	}
+	return f.Content
+}
+
+// prepareForWrite moves incoming content to the blob column. IsBinary describes
+// whether the response contains a hash in place of the bytes.
+func (f *AISkillFile) prepareForWrite() error {
+	size := int64(len(f.Content))
+	f.IsBinary = IsBinarySkillContent(f.Content)
+	if f.ContentBlob != nil {
+		size = int64(len(f.ContentBlob))
+		f.IsBinary = !utf8.Valid(f.ContentBlob) || bytes.IndexByte(f.ContentBlob, 0) >= 0
+	}
+	if err := ValidateAISkillFileSize(f.Name, size, f.IsBinary); err != nil {
+		return err
+	}
+	if f.ContentBlob == nil {
+		f.ContentBlob = []byte(f.Content)
+	}
+	f.ContentHash = ""
+	if f.IsBinary {
+		sum := sha256.Sum256(f.ContentBlob)
+		f.ContentHash = hex.EncodeToString(sum[:])
+	}
+	f.Content = ""
+	return nil
+}
+
+// PrepareContentResponse preserves text responses and returns the stored SHA-256
+// hash for binary files, computed alongside their content when writing.
+func (f *AISkillFile) PrepareContentResponse() {
+	if f.IsBinary {
+		f.Content = ""
+		return
+	}
+	f.ContentHash = ""
+	f.Content = f.RawContent()
+}
+
+const aiSkillFileMetadataColumns = "id, skill_id, name, is_binary, content_hash, size, created_at, created_by, updated_at, updated_by"
+
+// Binary content and its hash are written together. JSON responses only fetch
+// binary metadata; text content still supports the legacy content column.
+const aiSkillFileResponseColumns = aiSkillFileMetadataColumns + ", CASE WHEN is_binary THEN NULL ELSE content END AS content, CASE WHEN is_binary THEN NULL ELSE content_blob END AS content_blob"
+
 func AISkillFileGets(c *ctx.Context, skillId int64) ([]*AISkillFile, error) {
 	var lst []*AISkillFile
-	err := DB(c).Select("id, skill_id, name, size, created_at, created_by, updated_at, updated_by").Where("skill_id = ?", skillId).Order("id").Find(&lst).Error
+	err := DB(c).Select(aiSkillFileMetadataColumns).Where("skill_id = ?", skillId).Order("id").Find(&lst).Error
 	return lst, err
 }
 
@@ -73,9 +163,35 @@ func AISkillFileGetById(c *ctx.Context, id int64) (*AISkillFile, error) {
 	return AISkillFileGet(c, "id = ?", id)
 }
 
+func AISkillFileGetMetadataById(c *ctx.Context, id int64) (*AISkillFile, error) {
+	return aiSkillFileGetSelectedById(c, id, aiSkillFileMetadataColumns)
+}
+
+func AISkillFileGetResponseById(c *ctx.Context, id int64) (*AISkillFile, error) {
+	return aiSkillFileGetSelectedById(c, id, aiSkillFileResponseColumns)
+}
+
+func aiSkillFileGetSelectedById(c *ctx.Context, id int64, columns string) (*AISkillFile, error) {
+	var obj AISkillFile
+	err := DB(c).Select(columns).Where("id = ?", id).First(&obj).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	return &obj, err
+}
+
+func AISkillFileGetResponses(c *ctx.Context, skillId int64) ([]*AISkillFile, error) {
+	var files []*AISkillFile
+	err := DB(c).Select(aiSkillFileResponseColumns).Where("skill_id = ?", skillId).Order("id").Find(&files).Error
+	return files, err
+}
+
 func (f *AISkillFile) Create(c *ctx.Context) error {
 	now := time.Now().Unix()
-	f.Size = int64(len(f.Content))
+	if err := f.prepareForWrite(); err != nil {
+		return err
+	}
+	f.Size = int64(len(f.ContentBlob))
 	f.CreatedAt = now
 	f.UpdatedAt = now
 	f.UpdatedBy = f.CreatedBy
@@ -127,17 +243,22 @@ func AISkillFileBatchUpsert(c *ctx.Context, skillId int64, files []*AISkillFile,
 
 		for _, f := range files {
 			f.SkillId = skillId
-			f.Size = int64(len(f.Content))
+			if err := f.prepareForWrite(); err != nil {
+				return err
+			}
+			f.Size = int64(len(f.ContentBlob))
 			f.CreatedAt = now
 			f.UpdatedAt = now
 			f.UpdatedBy = f.CreatedBy
 
 			if existId, ok := existingMap[f.Name]; ok {
 				if err := tx.Model(&AISkillFile{Id: existId}).Updates(map[string]interface{}{
-					"content":    f.Content,
-					"size":       f.Size,
-					"updated_at": now,
-					"updated_by": f.CreatedBy,
+					"content_blob": f.ContentBlob,
+					"is_binary":    f.IsBinary,
+					"content_hash": f.ContentHash,
+					"size":         f.Size,
+					"updated_at":   now,
+					"updated_by":   f.CreatedBy,
 				}).Error; err != nil {
 					return err
 				}
@@ -159,7 +280,9 @@ func AISkillFileBatchUpsert(c *ctx.Context, skillId int64, files []*AISkillFile,
 			return fmt.Errorf("max %d files per skill, current: %d, importing: %d", MaxFilesPerSkill, totalCount, len(toInsert))
 		}
 
-		return tx.Create(&toInsert).Error
+		// One file per statement keeps several large binaries from exceeding
+		// the database packet limit in a single INSERT.
+		return tx.CreateInBatches(&toInsert, 1).Error
 	})
 }
 

@@ -49,7 +49,9 @@ The UI endpoints require administrator privileges (`auth` + `admin`); the servic
 | id | int64 | Primary key, auto-increment |
 | skill_id | int64 | ID of the associated skill |
 | name | string | Relative file path, e.g. `references/common/llm.md` or `scripts/api.py` |
-| content | string | File content (returned by the file detail endpoint only) |
+| content | string | Text content (returned by the file detail endpoint; empty for binary files) |
+| is_binary | bool | Whether the file is binary; binary bytes are fetched through a download endpoint |
+| content_hash | string | Lowercase hexadecimal SHA-256 of the original binary bytes; omitted for text files |
 | size | int64 | File size in bytes, computed automatically on creation |
 | created_at | int64 | Creation time (Unix timestamp) |
 | created_by | string | Creator |
@@ -474,11 +476,21 @@ This is the instructions section...
 
 | Limit | Value | Description |
 |--------|------|------|
-| Archive size | 10MB | Maximum size of the uploaded file |
-| Total size after extraction | 50MB | Guards against high-compression-ratio attacks |
-| SKILL.md size | 64KB | Matches the database TEXT column limit |
-| Size of a single resource file | 16MB | Matches the database MEDIUMTEXT column limit |
-| Number of resource files | 50 | At most 50 resource files per skill |
+| Archive size | 500 MiB | Maximum size of the uploaded file (524,288,000 bytes) |
+| Total size after extraction | 500 MiB | Includes SKILL.md and all extracted attachments |
+| SKILL.md size | 64 KiB | Independent limit for the skill definition |
+| Size of a single text resource file | 16 MiB | Valid UTF-8 without NUL bytes |
+| Size of a single binary resource file | 500 MiB | Original bytes before any encoding; stored in `content_blob` (`LONGBLOB` on MySQL) |
+| Number of files | Configurable (default 1000) | `AIAgent.MaxFilesPerSkill`; includes SKILL.md |
+
+The total limit includes every file, so an archive containing SKILL.md must leave
+space for it within the 500 MiB extracted total. Git imports and database-to-disk
+sync use the same individual text/binary file limits.
+
+For large files on MySQL, configure the server's `max_allowed_packet` to at least
+`512M` and the Go driver's DSN with `maxAllowedPacket=0` (read the server setting)
+or an explicit sufficiently large value. Reverse-proxy upload limits and HTTP
+timeouts must also permit the desired archive size and transfer duration.
 
 ### Response
 
@@ -494,7 +506,7 @@ Returns the ID of the newly created skill.
 ### Errors
 
 - `400` only `.zip` and `.tar.gz`/`.tgz` files are supported
-- `400` the archive is larger than 10MB
+- `400` the archive is larger than 500 MiB
 - `400` no `SKILL.md` found in the root directory
 - `400` `SKILL.md` has no valid YAML frontmatter, or `name` is empty
 - `400` `name` or `instructions` is empty (validation failure)
@@ -547,7 +559,11 @@ Returns the ID of the updated skill.
 
 ## Get resource file details
 
-Returns the full content of a single resource file.
+Returns text content or binary metadata for a single resource file.
+
+Text files use `content` as before. Binary files return `is_binary: true`, an
+empty `content`, and `content_hash` (SHA-256). No Base64 or raw binary content is
+included in JSON; fetch the bytes through the download endpoint below.
 
 ```
 GET /api/n9e/ai-skill-file/:fileId
@@ -581,6 +597,28 @@ GET /api/n9e/ai-skill-file/:fileId
 ### Errors
 
 - `404` the file does not exist
+
+---
+
+## Download a resource file
+
+```
+GET /api/n9e/ai-skill-file/:fileId/download
+```
+
+Returns the original bytes as an attachment, with `Content-Type:
+application/octet-stream` and a filename in `Content-Disposition`. The endpoint
+supports HTTP Range requests. For files with a stored hash, `ETag` contains the
+quoted SHA-256 hash returned by the detail endpoint.
+
+This endpoint uses the same login, skill-management permission, and parent-skill
+visibility checks as the file detail endpoint. Embedded builtin files with
+negative IDs are also supported. Legacy text files can be downloaded unchanged.
+
+### Errors
+
+- `403` the current user cannot view the parent skill
+- `404` the file or its parent skill does not exist
 
 ---
 
@@ -656,15 +694,17 @@ Behaves the same as the UI endpoint `GET /api/n9e/ai-skills`.
 
 ---
 
-### Get skill details (including file content)
+### Get skill details (text content and binary hashes)
 
 ```
 GET /v1/n9e/ai-skill/:id
 ```
 
-Returns the complete skill and all of its resource files (**including the `content` field**), so a service can fetch everything in one request.
+Returns the skill and its resource files. Text files include `content`; binary
+files include `is_binary: true`, an empty `content`, and `content_hash` (SHA-256).
+Binary bytes are fetched separately through the service download endpoint.
 
-> How it differs from the UI endpoint `GET /api/n9e/ai-skill/:id`: the UI endpoint's files omit `content` (the frontend loads it on demand), while the service endpoint's files include `content` (everything at once).
+> The UI endpoint `GET /api/n9e/ai-skill/:id` returns attachment metadata. This service endpoint also includes text attachment contents, while binaries are downloaded separately in both cases.
 
 #### Path parameters
 
@@ -718,6 +758,21 @@ Returns the complete skill and all of its resource files (**including the `conte
 #### Errors
 
 - `404` the skill does not exist
+
+---
+
+### Download a resource file
+
+```
+GET /v1/n9e/ai-skill-file/:fileId/download
+```
+
+Use a file ID from the skill detail response to fetch its original bytes. The
+response is an `application/octet-stream` attachment, supports Range requests,
+and uses the stored binary SHA-256 as its `ETag` when available. Its authentication
+is the same service API authentication used by `GET /v1/n9e/ai-skill/:id`.
+
+- `404` the file or its parent skill does not exist
 
 ---
 

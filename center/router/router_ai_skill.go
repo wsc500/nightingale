@@ -2,14 +2,19 @@ package router
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ccfos/nightingale/v6/aiagent/skill"
 	"github.com/ccfos/nightingale/v6/models"
@@ -324,7 +329,7 @@ func (rt *Router) aiSkillGet(c *gin.Context) {
 				filedetail, err := models.AISkillFileGetById(rt.Ctx, file.Id)
 				ginx.Dangerous(err)
 				if filedetail != nil {
-					obj.Instructions = filedetail.Content
+					obj.Instructions = filedetail.RawContent()
 				}
 				break
 			}
@@ -451,8 +456,10 @@ func (rt *Router) aiSkillDel(c *gin.Context) {
 // SKILL.md must contain valid YAML frontmatter with a non-empty name field.
 // 归档/解压/走读/markdown 解析都委托给 aiagent/skill 子包。
 func extractSkillArchive(c *gin.Context) (meta skill.Frontmatter, instructions string, files map[string]string) {
+	// Allow multipart headers and small form fields in addition to the archive.
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, skill.MaxArchiveSize+1024*1024)
 	file, header, err := c.Request.FormFile("file")
-	ginx.Dangerous(err)
+	ginx.Dangerous(err, http.StatusBadRequest)
 	defer file.Close()
 
 	lowerName := strings.ToLower(header.Filename)
@@ -462,26 +469,27 @@ func extractSkillArchive(c *gin.Context) (meta skill.Frontmatter, instructions s
 		ginx.Bomb(http.StatusBadRequest, "only .zip and .tar.gz/.tgz files are supported")
 	}
 
-	const maxArchiveSize = 10 * 1024 * 1024 // 10MB
-	if header.Size > maxArchiveSize {
-		ginx.Bomb(http.StatusBadRequest, "archive size exceeds 10MB limit")
+	if header.Size > skill.MaxArchiveSize {
+		ginx.Bomb(http.StatusBadRequest, "archive size exceeds 500MB limit")
 	}
 
-	// Use LimitReader to enforce size regardless of header.Size (which can be forged)
-	data, err := io.ReadAll(io.LimitReader(file, maxArchiveSize+1))
+	// Check actual size without allocating a second copy of a large archive.
+	archiveSize, err := file.Seek(0, io.SeekEnd)
 	ginx.Dangerous(err)
-	if int64(len(data)) > maxArchiveSize {
-		ginx.Bomb(http.StatusBadRequest, "archive size exceeds 10MB limit")
+	if archiveSize > skill.MaxArchiveSize {
+		ginx.Bomb(http.StatusBadRequest, "archive size exceeds 500MB limit")
 	}
+	_, err = file.Seek(0, io.SeekStart)
+	ginx.Dangerous(err)
 
 	tmpDir, err := os.MkdirTemp("", "skill-import-*")
 	ginx.Dangerous(err)
 	defer os.RemoveAll(tmpDir)
 
 	if isZip {
-		err = skill.ExtractZip(data, tmpDir)
+		err = skill.ExtractZipReader(file, archiveSize, tmpDir)
 	} else {
-		err = skill.ExtractTarGz(bytes.NewReader(data), tmpDir)
+		err = skill.ExtractTarGz(file, tmpDir)
 	}
 	ginx.Dangerous(err)
 
@@ -505,7 +513,8 @@ func extractSkillArchive(c *gin.Context) (meta skill.Frontmatter, instructions s
 
 	// files 里此时已经天然包含 SKILL.md 这条（Walk 不再剥离）。doSkillImport /
 	// doSkillImportUpdate 通过 AISkillFileBatchUpsert 遍历 files 落库时，SKILL.md
-	// 会作为普通一条记录落进 ai_skill_file 表 —— 原始字节保全。
+	// 会作为普通一条记录落进 ai_skill_file 表，BatchUpsert 将所有新内容写入
+	// content_blob，旧 content 列只用于读取历史记录。
 	return
 }
 
@@ -643,6 +652,14 @@ func (rt *Router) aiSkillImportUpdate(c *gin.Context) {
 }
 
 func (rt *Router) aiSkillFileGet(c *gin.Context) {
+	obj := rt.aiSkillFileForRead(c, false, false)
+	obj.PrepareContentResponse()
+	ginx.NewRender(c).Data(obj, nil)
+}
+
+// Authorize the metadata before fetching content, so unauthorized requests do
+// not load large binaries. The service API uses its existing group auth.
+func (rt *Router) aiSkillFileForRead(c *gin.Context, byService, withContent bool) *models.AISkillFile {
 	fileId := ginx.UrlParamInt64(c, "fileId")
 
 	// 负 id = 内置 skill 的只读附件（见 aiSkillGet 给 obj.Files 分配的负 id）。
@@ -661,18 +678,25 @@ func (rt *Router) aiSkillFileGet(c *gin.Context) {
 		if !ok {
 			ginx.Bomb(http.StatusNotFound, "file not found")
 		}
-		ginx.NewRender(c).Data(&models.AISkillFile{
+		obj := &models.AISkillFile{
 			Id:        fileId,
 			Name:      bf.RelPath,
 			Content:   content,
+			IsBinary:  models.IsBinarySkillContent(content),
 			Size:      bf.Size,
 			CreatedBy: "system",
 			UpdatedBy: "system",
-		}, nil)
-		return
+		}
+		// Embedded files do not use the database write path, so create their
+		// binary hash from the embedded bytes here.
+		if obj.IsBinary {
+			sum := sha256.Sum256([]byte(content))
+			obj.ContentHash = hex.EncodeToString(sum[:])
+		}
+		return obj
 	}
 
-	obj, err := models.AISkillFileGetById(rt.Ctx, fileId)
+	obj, err := models.AISkillFileGetMetadataById(rt.Ctx, fileId)
 	ginx.Dangerous(err)
 	if obj == nil {
 		ginx.Bomb(http.StatusNotFound, "file not found")
@@ -685,8 +709,41 @@ func (rt *Router) aiSkillFileGet(c *gin.Context) {
 	if parent == nil {
 		ginx.Bomb(http.StatusNotFound, "ai skill not found")
 	}
-	rt.ensureAISkillViewable(c, parent)
-	ginx.NewRender(c).Data(obj, nil)
+	if !byService {
+		rt.ensureAISkillViewable(c, parent)
+	}
+	if withContent {
+		obj, err = models.AISkillFileGetById(rt.Ctx, fileId)
+	} else {
+		obj, err = models.AISkillFileGetResponseById(rt.Ctx, fileId)
+	}
+	ginx.Dangerous(err)
+	if obj == nil {
+		ginx.Bomb(http.StatusNotFound, "file not found")
+	}
+	return obj
+}
+
+func (rt *Router) aiSkillFileDownload(c *gin.Context) {
+	rt.serveAISkillFile(c, rt.aiSkillFileForRead(c, false, true))
+}
+
+func (rt *Router) aiSkillFileDownloadByService(c *gin.Context) {
+	rt.serveAISkillFile(c, rt.aiSkillFileForRead(c, true, true))
+}
+
+func (rt *Router) serveAISkillFile(c *gin.Context, obj *models.AISkillFile) {
+	var content io.ReadSeeker = strings.NewReader(obj.Content)
+	if obj.ContentBlob != nil {
+		content = bytes.NewReader(obj.ContentBlob)
+	}
+	name := filepath.Base(obj.Name)
+	c.Header("Content-Type", "application/octet-stream")
+	c.Header("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": name}))
+	if obj.ContentHash != "" {
+		c.Header("ETag", `"`+obj.ContentHash+`"`)
+	}
+	http.ServeContent(c.Writer, c.Request, name, time.Unix(obj.UpdatedAt, 0), content)
 }
 
 func (rt *Router) aiSkillFileDel(c *gin.Context) {
@@ -707,8 +764,8 @@ func (rt *Router) aiSkillFileDel(c *gin.Context) {
 	ginx.NewRender(c).Message(obj.Delete(rt.Ctx))
 }
 
-// aiSkillGetWithFileContents returns skill detail with all file contents included.
-// Used by service API where the caller needs the full skill data in one request.
+// aiSkillGetWithFileContents returns text contents and binary hashes. Binaries
+// can be fetched separately through the service file-download endpoint.
 func (rt *Router) aiSkillGetWithFileContents(c *gin.Context) {
 	id := ginx.UrlParamInt64(c, "id")
 	obj, err := models.AISkillGetById(rt.Ctx, id)
@@ -717,8 +774,11 @@ func (rt *Router) aiSkillGetWithFileContents(c *gin.Context) {
 		ginx.Bomb(http.StatusNotFound, "ai skill not found")
 	}
 
-	files, err := models.AISkillFileGetContents(rt.Ctx, id)
+	files, err := models.AISkillFileGetResponses(rt.Ctx, id)
 	ginx.Dangerous(err)
+	for _, f := range files {
+		f.PrepareContentResponse()
+	}
 	obj.Files = files
 
 	rt.decorateAISkill(obj)

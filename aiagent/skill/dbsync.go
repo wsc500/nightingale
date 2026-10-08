@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/ccfos/nightingale/v6/models"
 	"github.com/toolkits/pkg/logger"
 	"gopkg.in/yaml.v3"
 )
@@ -36,7 +37,7 @@ type DBSkill struct {
 
 // DBSkillFile is a single attached file under a DB skill. Name is the relative
 // path inside the skill directory (e.g. "skill_tools/foo.yaml"); Content is raw
-// bytes-as-string (matches the `mediumtext` column type in ai_skill_file).
+// bytes-as-string, selected from the blob column or legacy text fallback by the caller.
 type DBSkillFile struct {
 	Name    string
 	Content string
@@ -198,12 +199,8 @@ func writeOneSkill(skillsPath string, s *DBSkill) error {
 			continue
 		}
 
-		if rel == "SKILL.md" {
-			if len(f.Content) > MaxSkillMD {
-				return fmt.Errorf("SKILL.md exceeds %dKB limit (%d bytes)", MaxSkillMD/1024, len(f.Content))
-			}
-		} else if int64(len(f.Content)) > MaxSingleFile {
-			return fmt.Errorf("file %s exceeds %dMB limit (%d bytes)", rel, MaxSingleFile/1024/1024, len(f.Content))
+		if err := models.ValidateAISkillFileSize(rel, int64(len(f.Content)), models.IsBinarySkillContent(f.Content)); err != nil {
+			return err
 		}
 
 		full := filepath.Join(dir, rel)

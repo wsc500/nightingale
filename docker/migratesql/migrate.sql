@@ -522,3 +522,9 @@ ALTER TABLE `source_token` ADD KEY `idx_source_token_token` (`token`);
    PostgreSQL 请执行：ALTER TABLE users ADD COLUMN disabled int NOT NULL DEFAULT 0;
    通常不需要手工执行，程序启动时的 AutoMigrate 会补上这一列 */
 ALTER TABLE `users` ADD COLUMN `disabled` int NOT NULL DEFAULT 0 COMMENT '0:enabled 1:disabled';
+
+/* v9 2026-09-23 AI skill file binary content; keep legacy content for reads.
+   Normally added by AutoMigrate at startup. */
+ALTER TABLE `ai_skill_file` ADD COLUMN `content_blob` longblob COMMENT 'raw file content';
+ALTER TABLE `ai_skill_file` ADD COLUMN `is_binary` tinyint(1) NOT NULL DEFAULT 0 COMMENT 'binary file flag';
+ALTER TABLE `ai_skill_file` ADD COLUMN `content_hash` varchar(64) NOT NULL DEFAULT '' COMMENT 'binary content SHA-256';

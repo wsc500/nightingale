@@ -31,7 +31,7 @@ const corpusHashMarker = ".corpus_hash"
 
 // 解压安全上限。语料实测 ~4500 文件 / 18MB，上限放百倍余量；不复用
 // archive.go 的 MaxTotalExtracted/models.MaxFilesPerSkill——那是按"单个用户
-// skill"标定的配额（50MB / 每 skill 行数上限），与整仓语料不是一个量级。
+// skill"标定的配额（500 MiB / 每 skill 行数上限），与整仓语料的配额独立。
 const (
 	corpusMaxFiles      = 100_000
 	corpusMaxTotalBytes = 200 << 20

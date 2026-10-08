@@ -101,7 +101,7 @@ func (rt *Router) doSyncAllAISkillsFromDB() {
 		rowFiles := filesByID[s.Id]
 		dbFiles := make([]skill.DBSkillFile, 0, len(rowFiles))
 		for _, f := range rowFiles {
-			dbFiles = append(dbFiles, skill.DBSkillFile{Name: f.Name, Content: f.Content})
+			dbFiles = append(dbFiles, skill.DBSkillFile{Name: f.Name, Content: f.RawContent()})
 		}
 		dbSkills = append(dbSkills, skill.DBSkill{
 			Name:          s.Name,

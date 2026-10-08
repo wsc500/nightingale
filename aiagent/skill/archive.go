@@ -28,9 +28,11 @@ import (
 // 所以解压期的文件数上限和 DB 层 per-skill 行数上限本就是同一个边界，由 toml 的
 // AIAgent.MaxFilesPerSkill 一处配置、两处强制。
 const (
-	MaxTotalExtracted = 50 * 1024 * 1024 // 解压后总大小上限
-	MaxSingleFile     = 16 * 1024 * 1024 // 单文件上限（对齐 MEDIUMTEXT）
-	MaxSkillMD        = 64 * 1024        // SKILL.md 本身的上限（对齐 TEXT）
+	MaxArchiveSize    = 500 * 1024 * 1024 // 上传压缩包大小上限
+	MaxTotalExtracted = 500 * 1024 * 1024 // 解压后总大小上限
+	MaxSingleFile     = models.MaxSkillBinaryFileSize
+	MaxTextFile       = models.MaxSkillTextFileSize
+	MaxSkillMD        = models.MaxSkillMDSize // SKILL.md 仍单独限制为 64 KiB
 )
 
 // isArchiveNoise 判断归档条目是否是系统/打包工具产生的噪声（macOS AppleDouble、
@@ -48,7 +50,13 @@ func isArchiveNoise(name string) bool {
 //  1. 按 header 声明的大小预扫描（防止文件数过多 / 单文件过大 / 解压总量过大）；
 //  2. 实际拷贝时再用 LimitReader 兜底，防止 header 被伪造。
 func ExtractZip(data []byte, destDir string) error {
-	r, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	return ExtractZipReader(bytes.NewReader(data), int64(len(data)), destDir)
+}
+
+// ExtractZipReader reads directly from the uploaded file, which multipart may
+// have spooled to disk, without keeping another archive-sized copy in memory.
+func ExtractZipReader(reader io.ReaderAt, size int64, destDir string) error {
+	r, err := zip.NewReader(reader, size)
 	if err != nil {
 		return fmt.Errorf("failed to open zip: %w", err)
 	}

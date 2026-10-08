@@ -155,7 +155,7 @@ func getSkill(_ context.Context, deps *aiagent.ToolDeps, args map[string]interfa
 	var others []string
 	for _, f := range files {
 		if f.Name == "SKILL.md" {
-			skillMD = f.Content
+			skillMD = f.RawContent()
 			continue
 		}
 		others = append(others, fmt.Sprintf("- %s (%d bytes)", f.Name, f.Size))
@@ -621,7 +621,7 @@ func loadSkillMarkdown(deps *aiagent.ToolDeps, skillId int64) (raw string, meta 
 	}
 	for _, f := range files {
 		if f.Name == "SKILL.md" {
-			raw = f.Content
+			raw = f.RawContent()
 			break
 		}
 	}
@@ -650,7 +650,7 @@ func materializeSkillToDisk(deps *aiagent.ToolDeps, skillId int64, name string) 
 	}
 	dbFiles := make([]skillpkg.DBSkillFile, 0, len(files))
 	for _, f := range files {
-		dbFiles = append(dbFiles, skillpkg.DBSkillFile{Name: f.Name, Content: f.Content})
+		dbFiles = append(dbFiles, skillpkg.DBSkillFile{Name: f.Name, Content: f.RawContent()})
 	}
 	if err := skillpkg.SyncOneDBSkill(deps.SkillsPath, skillpkg.DBSkill{Name: name, Files: dbFiles}); err != nil {
 		logger.Warningf("skill %q: materialize to disk failed (periodic sync will backstop): %v", name, err)

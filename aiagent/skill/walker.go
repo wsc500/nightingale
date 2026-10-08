@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/ccfos/nightingale/v6/models"
 )
 
 // Walk 走读已解压的 skill 目录，返回 relPath → content 的文件映射。
@@ -13,10 +15,11 @@ import (
 //
 // 实现会自动 unwrap 单层顶级目录（archive root，见 archiveRoot），
 // 并跳过 .* 和 __MACOSX 等系统噪声条目。SKILL.md 单独走 MaxSkillMD 限额，
-// 其它文件走 MaxSingleFile 限额。
+// 文本附件和二进制附件分别走 16 MiB 与 500 MiB 限额。
 func Walk(dir string) (files map[string]string, err error) {
 	dir = archiveRoot(dir)
 	files = make(map[string]string)
+	var totalSize int64
 
 	err = filepath.WalkDir(dir, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -48,18 +51,30 @@ func Walk(dir string) (files map[string]string, err error) {
 		if d.IsDir() {
 			return nil
 		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		// Reject oversized files before allocating their content, including
+		// Git files that did not pass through the archive extractor.
+		if err := models.ValidateAISkillFileSize(relPath, info.Size(), true); err != nil {
+			return err
+		}
+		if totalSize+info.Size() > MaxTotalExtracted {
+			return fmt.Errorf("total extracted size exceeds %dMB limit", MaxTotalExtracted/1024/1024)
+		}
 
 		content, err := os.ReadFile(path)
 		if err != nil {
 			return err
 		}
 
-		if relPath == "SKILL.md" {
-			if len(content) > MaxSkillMD {
-				return fmt.Errorf("SKILL.md exceeds %dKB limit (%d bytes)", MaxSkillMD/1024, len(content))
-			}
-		} else if int64(len(content)) > MaxSingleFile {
-			return fmt.Errorf("file %s exceeds %dMB limit (%d bytes)", relPath, MaxSingleFile/1024/1024, len(content))
+		if err := models.ValidateAISkillFileSize(relPath, int64(len(content)), models.IsBinarySkillContent(string(content))); err != nil {
+			return err
+		}
+		totalSize += int64(len(content))
+		if totalSize > MaxTotalExtracted {
+			return fmt.Errorf("total extracted size exceeds %dMB limit", MaxTotalExtracted/1024/1024)
 		}
 		files[relPath] = string(content)
 		return nil

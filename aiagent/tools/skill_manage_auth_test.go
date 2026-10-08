@@ -166,7 +166,7 @@ func TestSkillDraftSurvivesAuthFormRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse restored files: %v", err)
 	}
-	if len(files) != 1 || files[0].Name != "main.py" || files[0].Content != script {
+	if len(files) != 1 || files[0].Name != "main.py" || files[0].RawContent() != script {
 		t.Fatalf("script file lost or altered across the form round trip: %+v", files)
 	}
 

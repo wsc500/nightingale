@@ -709,6 +709,7 @@ func (rt *Router) Config(r *gin.Engine) {
 		pages.PUT("/ai-skill/:id/git/install", rt.auth(), rt.user(), rt.perm("/ai-config/skills"), rt.aiSkillGitInstallPut)
 		pages.POST("/ai-skill/:id/git/update", rt.auth(), rt.user(), rt.perm("/ai-config/skills"), rt.aiSkillGitUpdate)
 		pages.GET("/ai-skill-file/:fileId", rt.auth(), rt.user(), rt.perm("/ai-config/skills"), rt.aiSkillFileGet)
+		pages.GET("/ai-skill-file/:fileId/download", rt.auth(), rt.user(), rt.perm("/ai-config/skills"), rt.aiSkillFileDownload)
 		pages.DELETE("/ai-skill-file/:fileId", rt.auth(), rt.user(), rt.perm("/ai-config/skills"), rt.aiSkillFileDel)
 
 		// AI Assistant Chat
@@ -942,6 +943,7 @@ func (rt *Router) Config(r *gin.Engine) {
 			service.GET("/ai-skills", rt.aiSkillGets)
 			service.GET("/ai-skills/visible", rt.aiSkillVisibleGetsByService)
 			service.GET("/ai-skill/:id", rt.aiSkillGetWithFileContents)
+			service.GET("/ai-skill-file/:fileId/download", rt.aiSkillFileDownloadByService)
 			service.POST("/ai-skills", rt.aiSkillAddByService)
 			service.POST("/ai-skills/import", rt.aiSkillImportByService)
 			service.PUT("/ai-skill/:id/import", rt.aiSkillImportUpdateByService)
